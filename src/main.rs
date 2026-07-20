@@ -178,7 +178,7 @@ impl PointerState {
 struct MouseStroke {
     stroke: Option<StrokeId>,
     tool: Tool,
-    last_position: Option<Vec2>,
+    last_point: Option<StrokePoint>,
 }
 
 #[derive(Clone, Copy)]
@@ -714,15 +714,19 @@ fn collect_mouse_strokes(
                 &window,
             ) {
                 if let Some(stroke) = mouse.stroke {
-                    if mouse.last_position != Some(position) {
+                    if mouse
+                        .last_point
+                        .is_none_or(|previous| sample_is_spaced(previous, point))
+                    {
                         document.append_point(stroke, point);
+                        mouse.last_point = Some(point);
                     }
                 } else {
                     let (stroke, _) = document.begin_stroke(point, tool.profile(&settings));
                     mouse.stroke = Some(stroke);
                     mouse.tool = tool;
+                    mouse.last_point = Some(point);
                 }
-                mouse.last_position = Some(position);
             }
         }
     }
@@ -752,7 +756,13 @@ fn end_mouse_stroke(document: &mut StrokeDocument, mouse: &mut MouseStroke) {
     if let Some(stroke) = mouse.stroke.take() {
         document.end_stroke(stroke);
     }
-    mouse.last_position = None;
+    mouse.last_point = None;
+}
+
+fn sample_is_spaced(previous: StrokePoint, current: StrokePoint) -> bool {
+    let previous_spacing = (previous.half_width * 0.32).max(0.7);
+    let current_spacing = (current.half_width * 0.32).max(0.7);
+    previous.position.distance(current.position) >= previous_spacing.min(current_spacing)
 }
 
 fn mouse_point(
@@ -882,7 +892,7 @@ fn keyboard_shortcuts(
     if !ctrl && keys.just_pressed(KeyCode::KeyC) {
         document.clear();
         mouse.stroke = None;
-        mouse.last_position = None;
+        mouse.last_point = None;
     }
     if ctrl && keys.just_pressed(KeyCode::KeyZ) {
         if shift {
@@ -911,7 +921,7 @@ fn keyboard_shortcuts(
                     let issues = loaded.compatibility_issues.len();
                     document.replace_loaded(loaded.document);
                     mouse.stroke = None;
-                    mouse.last_position = None;
+                    mouse.last_point = None;
                     document_status.0 = if issues == 0 {
                         format!("loaded {DOCUMENT_PATH}")
                     } else {
