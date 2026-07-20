@@ -21,7 +21,7 @@ cargo run --release
 
 ## Controls
 
-- Tablet pen contact: draw with pressure.
+- Tablet pen contact: draw with pressure and tilt.
 - Tablet eraser tip: erase.
 - Left mouse drag: draw through the engine's document API.
 - Right mouse drag: erase through the engine's document API.
@@ -37,6 +37,11 @@ cargo run --release
 - `H`: toggle active-layer visibility.
 - `,` / `.`: reduce or increase active-layer opacity.
 
-The cursor's colored ring shows the engine's pressure-adjusted round footprint.
-Its short direction tick reports tablet tilt captured by the engine, although
-the current coverage shader still renders round strokes.
+The advanced color selector at the upper right uses a hue ring and a
+saturation/value triangle. Drag either with the mouse or tablet pen; releasing
+commits an immutable material for subsequent strokes.
+
+The cursor outline uses the same pressure/tilt footprint as the engine. The tip
+stays circular through 35 degrees of tilt, then progressively becomes an oval
+through 75 degrees. Only the feather-light bottom 15 percent of normalized pen
+pressure reduces deposition opacity; firmer input remains fully opaque.

@@ -1,19 +1,26 @@
 use std::num::NonZeroU32;
 
 use bevy::{
+    asset::RenderAssetUsages,
+    image::ImageSampler,
     input::{
+        InputSystems,
         mouse::MouseButton,
         pen::{PenAction, PenButton, PenData, PenInput, PenPressure, PenToolKind},
     },
     prelude::*,
-    render::pipelined_rendering::PipelinedRenderingPlugin,
+    render::{
+        pipelined_rendering::PipelinedRenderingPlugin,
+        render_resource::{Extent3d, TextureDimension, TextureFormat},
+    },
     window::{CursorLeft, CursorMoved, CursorOptions, PresentMode, PrimaryWindow, WindowPlugin},
     winit::WinitSettings,
 };
 use hamerons_stroke_render::{
     BrushProfile, BrushSizeSpace, CanvasTileCache, CheckpointRequest, DocumentCheckpointManager,
-    EffectRegistry, HameronsStrokeRenderPlugin, PaintModelRegistry, StrokeDocument, StrokeId,
-    StrokePoint, StrokeRendererSettings,
+    EffectRegistry, HameronsStrokeRenderPlugin, PaintModelRegistry, RgbaMaterial, RgbaPaintModel,
+    StrokeDocument, StrokeId, StrokeInputBlocker, StrokeInputSystems, StrokePoint,
+    StrokeRendererSettings,
 };
 
 const START_WIDTH: u32 = 1_200;
@@ -21,6 +28,16 @@ const START_HEIGHT: u32 = 750;
 const MIN_BRUSH_SIZE: f32 = 2.0;
 const MAX_BRUSH_SIZE: f32 = 180.0;
 const DOCUMENT_PATH: &str = "stroke_lab.kra";
+const PICKER_WIDTH: u32 = 270;
+const PICKER_HEIGHT: u32 = 310;
+const PICKER_TOP: f32 = 14.0;
+const PICKER_RIGHT: f32 = 14.0;
+const PICKER_CENTER: Vec2 = Vec2::new(135.0, 135.0);
+const PICKER_RING_INNER: f32 = 91.0;
+const PICKER_RING_OUTER: f32 = 111.0;
+const PICKER_BLACK: Vec2 = Vec2::new(135.0, 62.0);
+const PICKER_WHITE: Vec2 = Vec2::new(74.0, 185.0);
+const PICKER_HUE: Vec2 = Vec2::new(196.0, 185.0);
 
 fn main() {
     let default_plugins = DefaultPlugins
@@ -51,12 +68,20 @@ fn main() {
         .init_resource::<PointerState>()
         .init_resource::<MouseStroke>()
         .init_resource::<DocumentStatus>()
+        .init_resource::<ColorSelector>()
         .add_systems(Startup, setup)
+        .add_systems(
+            PreUpdate,
+            update_stroke_input_blocker
+                .after(InputSystems)
+                .before(StrokeInputSystems::Collect),
+        )
         .add_systems(
             Update,
             (
-                collect_mouse_strokes,
                 observe_pen_pointer,
+                handle_color_selector,
+                collect_mouse_strokes,
                 keyboard_shortcuts,
                 poll_document_checkpoint,
                 draw_brush_preview,
@@ -166,12 +191,82 @@ impl Default for DocumentStatus {
 #[derive(Component)]
 struct HudText;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectorTarget {
+    Hue,
+    SaturationValue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectorSource {
+    Mouse,
+    Pen,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SelectorDrag {
+    target: SelectorTarget,
+    source: SelectorSource,
+}
+
+#[derive(Resource)]
+struct ColorSelector {
+    hue: f32,
+    saturation: f32,
+    value: f32,
+    image: Handle<Image>,
+    drag: Option<SelectorDrag>,
+    hovered: bool,
+}
+
+impl Default for ColorSelector {
+    fn default() -> Self {
+        Self {
+            hue: 0.62,
+            saturation: 0.55,
+            value: 0.17,
+            image: default(),
+            drag: None,
+            hovered: false,
+        }
+    }
+}
+
 fn setup(
     mut commands: Commands,
     mut cursor_options: Single<&mut CursorOptions, With<PrimaryWindow>>,
+    mut images: ResMut<Assets<Image>>,
+    mut selector: ResMut<ColorSelector>,
 ) {
     cursor_options.visible = false;
     commands.spawn(Camera2d);
+
+    let image = images.add(color_selector_image(&selector));
+    selector.image = image.clone();
+    commands.spawn((
+        ImageNode::new(image),
+        Node {
+            position_type: PositionType::Absolute,
+            top: px(PICKER_TOP),
+            right: px(PICKER_RIGHT),
+            width: px(PICKER_WIDTH),
+            height: px(PICKER_HEIGHT),
+            border: UiRect::all(px(1)),
+            ..default()
+        },
+        BorderColor::all(Color::srgba(0.7, 0.72, 0.76, 0.35)),
+    ));
+    commands.spawn((
+        Text::new("ADVANCED COLOR SELECTOR"),
+        TextFont::from_font_size(13.0),
+        TextColor(Color::srgb(0.82, 0.83, 0.85)),
+        Node {
+            position_type: PositionType::Absolute,
+            top: px(PICKER_TOP + 6.0),
+            right: px(PICKER_RIGHT + 54.0),
+            ..default()
+        },
+    ));
 
     commands.spawn((
         HudText,
@@ -192,6 +287,295 @@ fn setup(
     ));
 }
 
+fn update_stroke_input_blocker(
+    window: Single<&Window, With<PrimaryWindow>>,
+    mut blocker: ResMut<StrokeInputBlocker>,
+) {
+    blocker.set_regions([picker_rect(&window)]);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_color_selector(
+    window: Single<&Window, With<PrimaryWindow>>,
+    mouse_buttons: Res<ButtonInput<MouseButton>>,
+    mut pen_events: MessageReader<PenInput>,
+    mut selector: ResMut<ColorSelector>,
+    mut images: ResMut<Assets<Image>>,
+    mut rgba: ResMut<RgbaPaintModel>,
+    mut settings: ResMut<StrokeRendererSettings>,
+) {
+    let cursor = window.cursor_position();
+    selector.hovered = cursor.is_some_and(|position| picker_rect(&window).contains(position));
+    let mut changed = false;
+    let mut commit = false;
+
+    if mouse_buttons.just_pressed(MouseButton::Left)
+        && let Some(local) = cursor.map(|position| picker_local(&window, position))
+        && let Some(target) = selector_target(local)
+    {
+        selector.drag = Some(SelectorDrag {
+            target,
+            source: SelectorSource::Mouse,
+        });
+        changed |= apply_selector_position(&mut selector, target, local);
+    }
+    if let Some(drag) = selector.drag
+        && drag.source == SelectorSource::Mouse
+        && mouse_buttons.pressed(MouseButton::Left)
+        && let Some(local) = cursor.map(|position| picker_local(&window, position))
+    {
+        changed |= apply_selector_position(&mut selector, drag.target, local);
+    }
+    if mouse_buttons.just_released(MouseButton::Left)
+        && selector
+            .drag
+            .is_some_and(|drag| drag.source == SelectorSource::Mouse)
+    {
+        selector.drag = None;
+        commit = true;
+    }
+
+    for event in pen_events.read() {
+        if !event.pen.primary {
+            continue;
+        }
+        let Some(position) = event.pen.position else {
+            continue;
+        };
+        let local = picker_local(&window, position);
+        match &event.action {
+            PenAction::Button {
+                button: PenButton::Contact,
+                state,
+                ..
+            } if state.is_pressed() => {
+                if let Some(target) = selector_target(local) {
+                    selector.drag = Some(SelectorDrag {
+                        target,
+                        source: SelectorSource::Pen,
+                    });
+                    changed |= apply_selector_position(&mut selector, target, local);
+                }
+            }
+            PenAction::Moved(_)
+                if selector
+                    .drag
+                    .is_some_and(|drag| drag.source == SelectorSource::Pen) =>
+            {
+                let target = selector.drag.expect("pen drag checked above").target;
+                changed |= apply_selector_position(&mut selector, target, local);
+            }
+            PenAction::Button {
+                button: PenButton::Contact,
+                state,
+                ..
+            } if !state.is_pressed()
+                && selector
+                    .drag
+                    .is_some_and(|drag| drag.source == SelectorSource::Pen) =>
+            {
+                let target = selector.drag.expect("pen drag checked above").target;
+                changed |= apply_selector_position(&mut selector, target, local);
+                selector.drag = None;
+                commit = true;
+            }
+            PenAction::Left
+                if selector
+                    .drag
+                    .is_some_and(|drag| drag.source == SelectorSource::Pen) =>
+            {
+                selector.drag = None;
+                commit = true;
+            }
+            _ => {}
+        }
+    }
+
+    if changed && let Some(mut image) = images.get_mut(&selector.image) {
+        *image = color_selector_image(&selector);
+    }
+    if commit {
+        let srgb = selector_srgb(&selector);
+        let linear = srgb.map(srgb_to_linear);
+        let material = rgba.add_material(RgbaMaterial::from_linear_rgba([
+            linear[0], linear[1], linear[2], 1.0,
+        ]));
+        settings.pen.paint.material = material;
+    }
+}
+
+fn picker_rect(window: &Window) -> Rect {
+    let min = Vec2::new(
+        window.width() - PICKER_RIGHT - PICKER_WIDTH as f32,
+        PICKER_TOP,
+    );
+    Rect::from_corners(
+        min,
+        min + Vec2::new(PICKER_WIDTH as f32, PICKER_HEIGHT as f32),
+    )
+}
+
+fn picker_local(window: &Window, viewport_position: Vec2) -> Vec2 {
+    viewport_position - picker_rect(window).min
+}
+
+fn selector_target(local: Vec2) -> Option<SelectorTarget> {
+    let ring_distance = local.distance(PICKER_CENTER);
+    if (PICKER_RING_INNER..=PICKER_RING_OUTER).contains(&ring_distance) {
+        Some(SelectorTarget::Hue)
+    } else if triangle_barycentric(local)
+        .is_some_and(|weights| weights.into_iter().all(|weight| weight >= 0.0))
+    {
+        Some(SelectorTarget::SaturationValue)
+    } else {
+        None
+    }
+}
+
+fn apply_selector_position(
+    selector: &mut ColorSelector,
+    target: SelectorTarget,
+    local: Vec2,
+) -> bool {
+    let before = (selector.hue, selector.saturation, selector.value);
+    match target {
+        SelectorTarget::Hue => {
+            let delta = local - PICKER_CENTER;
+            selector.hue =
+                (-delta.y).atan2(delta.x).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
+        }
+        SelectorTarget::SaturationValue => {
+            if let Some(mut weights) = triangle_barycentric(local) {
+                for weight in &mut weights {
+                    *weight = weight.max(0.0);
+                }
+                let total = weights.into_iter().sum::<f32>().max(f32::EPSILON);
+                let black = weights[0] / total;
+                let white = weights[1] / total;
+                let hue = weights[2] / total;
+                selector.value = 1.0 - black;
+                selector.saturation = if white + hue > f32::EPSILON {
+                    hue / (white + hue)
+                } else {
+                    0.0
+                };
+            }
+        }
+    }
+    before != (selector.hue, selector.saturation, selector.value)
+}
+
+fn triangle_barycentric(point: Vec2) -> Option<[f32; 3]> {
+    let edge_0 = PICKER_WHITE - PICKER_BLACK;
+    let edge_1 = PICKER_HUE - PICKER_BLACK;
+    let relative = point - PICKER_BLACK;
+    let denominator = edge_0.x * edge_1.y - edge_1.x * edge_0.y;
+    if denominator.abs() <= f32::EPSILON {
+        return None;
+    }
+    let white = (relative.x * edge_1.y - edge_1.x * relative.y) / denominator;
+    let hue = (edge_0.x * relative.y - relative.x * edge_0.y) / denominator;
+    Some([1.0 - white - hue, white, hue])
+}
+
+fn color_selector_image(selector: &ColorSelector) -> Image {
+    let mut pixels = vec![0; (PICKER_WIDTH * PICKER_HEIGHT * 4) as usize];
+    let hue_color = hsv_to_srgb(selector.hue, 1.0, 1.0);
+    for y in 0..PICKER_HEIGHT {
+        for x in 0..PICKER_WIDTH {
+            let point = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+            let mut color = [0.17, 0.18, 0.20];
+            let ring_distance = point.distance(PICKER_CENTER);
+            if (PICKER_RING_INNER..=PICKER_RING_OUTER).contains(&ring_distance) {
+                let delta = point - PICKER_CENTER;
+                let hue = (-delta.y).atan2(delta.x).rem_euclid(std::f32::consts::TAU)
+                    / std::f32::consts::TAU;
+                color = hsv_to_srgb(hue, 1.0, 1.0);
+            } else if let Some([black, white, hue]) = triangle_barycentric(point)
+                && black >= 0.0
+                && white >= 0.0
+                && hue >= 0.0
+            {
+                color = [
+                    white + hue_color[0] * hue,
+                    white + hue_color[1] * hue,
+                    white + hue_color[2] * hue,
+                ];
+            } else if (258..=294).contains(&y) && (18..=251).contains(&x) {
+                color = selector_srgb(selector);
+            }
+
+            let ring_marker = PICKER_CENTER
+                + Vec2::from_angle(-selector.hue * std::f32::consts::TAU)
+                    * ((PICKER_RING_INNER + PICKER_RING_OUTER) * 0.5);
+            let triangle_marker = PICKER_BLACK * (1.0 - selector.value)
+                + PICKER_WHITE * (selector.value * (1.0 - selector.saturation))
+                + PICKER_HUE * (selector.value * selector.saturation);
+            let marker_distance = point
+                .distance(ring_marker)
+                .min(point.distance(triangle_marker));
+            if (4.0..=6.0).contains(&marker_distance) {
+                color = [0.95, 0.96, 0.98];
+            } else if marker_distance < 4.0 {
+                color = [0.05, 0.055, 0.065];
+            }
+
+            let index = ((y * PICKER_WIDTH + x) * 4) as usize;
+            pixels[index..index + 4].copy_from_slice(&[
+                color_byte(color[0]),
+                color_byte(color[1]),
+                color_byte(color[2]),
+                255,
+            ]);
+        }
+    }
+    let mut image = Image::new(
+        Extent3d {
+            width: PICKER_WIDTH,
+            height: PICKER_HEIGHT,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        pixels,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    image.sampler = ImageSampler::linear();
+    image
+}
+
+fn selector_srgb(selector: &ColorSelector) -> [f32; 3] {
+    hsv_to_srgb(selector.hue, selector.saturation, selector.value)
+}
+
+fn hsv_to_srgb(hue: f32, saturation: f32, value: f32) -> [f32; 3] {
+    let sector = hue.rem_euclid(1.0) * 6.0;
+    let chroma = value * saturation;
+    let intermediate = chroma * (1.0 - (sector.rem_euclid(2.0) - 1.0).abs());
+    let [red, green, blue] = match sector as u32 {
+        0 => [chroma, intermediate, 0.0],
+        1 => [intermediate, chroma, 0.0],
+        2 => [0.0, chroma, intermediate],
+        3 => [0.0, intermediate, chroma],
+        4 => [intermediate, 0.0, chroma],
+        _ => [chroma, 0.0, intermediate],
+    };
+    let match_value = value - chroma;
+    [red + match_value, green + match_value, blue + match_value]
+}
+
+fn srgb_to_linear(srgb: f32) -> f32 {
+    if srgb <= 0.040_45 {
+        srgb / 12.92
+    } else {
+        ((srgb + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn color_byte(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_mouse_strokes(
     mut cursor_events: MessageReader<CursorMoved>,
@@ -203,6 +587,7 @@ fn collect_mouse_strokes(
     mut document: ResMut<StrokeDocument>,
     mut mouse: ResMut<MouseStroke>,
     mut pointer: ResMut<PointerState>,
+    selector: Res<ColorSelector>,
 ) {
     let mut latest_position = pointer
         .position
@@ -222,6 +607,11 @@ fn collect_mouse_strokes(
     };
     let pressed = mouse_buttons.just_pressed(MouseButton::Left)
         || mouse_buttons.just_pressed(MouseButton::Right);
+
+    if selector.hovered || selector.drag.is_some() {
+        end_mouse_stroke(&mut document, &mut mouse);
+        return;
+    }
 
     if down && (pressed || mouse.tool != tool) {
         end_mouse_stroke(&mut document, &mut mouse);
@@ -293,18 +683,17 @@ fn mouse_point(
         .viewport_to_world_2d(camera_transform, viewport_position + Vec2::X)
         .or_else(|_| camera.viewport_to_world_2d(camera_transform, viewport_position - Vec2::X))
         .ok()?;
-    let half_width = match profile.size_space {
-        BrushSizeSpace::Document => brush_radius(profile, 1.0),
-        BrushSizeSpace::Screen => {
-            brush_radius(profile, 1.0) * position.distance(neighbor)
-                / window.scale_factor().max(0.01)
-        }
+    let footprint = profile.footprint(1.0, 0.0);
+    let document_scale = match profile.size_space {
+        BrushSizeSpace::Document => 1.0,
+        BrushSizeSpace::Screen => position.distance(neighbor) / window.scale_factor().max(0.01),
     };
 
     Some(StrokePoint {
         position,
-        half_width,
-        flow: profile.flow.clamp(0.0, 1.0),
+        half_width: footprint.half_size.y * document_scale,
+        aspect_ratio: footprint.half_size.x / footprint.half_size.y,
+        flow: footprint.flow,
         orientation: Vec2::Y,
         twist_radians: 0.0,
     })
@@ -497,7 +886,11 @@ fn draw_brush_preview(
     window: Single<&Window, With<PrimaryWindow>>,
     pointer: Res<PointerState>,
     settings: Res<StrokeRendererSettings>,
+    selector: Res<ColorSelector>,
 ) {
+    if pointer.down || selector.hovered || selector.drag.is_some() {
+        return;
+    }
     let Some(position) = pointer.position else {
         return;
     };
@@ -506,25 +899,33 @@ fn draw_brush_preview(
     } else {
         1.0
     };
-    let radius =
-        brush_radius(pointer.tool.profile(&settings), pressure) / window.scale_factor().max(0.01);
+    let footprint = pointer
+        .tool
+        .profile(&settings)
+        .footprint(pressure, pointer.tilt.length());
+    let half_size = footprint.half_size / window.scale_factor().max(0.01);
     let world_position = Vec2::new(
         position.x - window.width() * 0.5,
         window.height() * 0.5 - position.y,
     );
+    let selected = selector_srgb(&selector);
     let color = match pointer.tool {
-        Tool::Pen => Color::srgb(0.10, 0.48, 0.95),
+        Tool::Pen => Color::srgb(selected[0], selected[1], selected[2]),
         Tool::Eraser => Color::srgb(0.94, 0.25, 0.34),
     };
 
+    let direction = Vec2::new(pointer.tilt.x, -pointer.tilt.y).normalize_or(Vec2::X);
     gizmos
-        .circle_2d(world_position, radius.max(0.65), color)
+        .ellipse_2d(
+            Isometry2d::new(world_position, Rot2::radians(direction.to_angle())),
+            half_size.max(Vec2::splat(0.65)),
+            color,
+        )
         .resolution(48);
     if pointer.tilt.length_squared() > 0.01 {
-        let direction = Vec2::new(pointer.tilt.x, -pointer.tilt.y).normalize_or_zero();
         gizmos.line_2d(
             world_position,
-            world_position + direction * radius.max(7.0),
+            world_position + direction * half_size.x.max(7.0),
             color,
         );
     }
@@ -585,13 +986,6 @@ fn update_hud(
     }
 }
 
-fn brush_radius(profile: BrushProfile, pressure: f32) -> f32 {
-    let pressure = pressure.powf(profile.pressure_gamma.max(0.01));
-    let minimum = profile.minimum_diameter_ratio.clamp(0.0, 1.0);
-    let diameter = profile.diameter.max(0.25) * (minimum + (1.0 - minimum) * pressure);
-    diameter * 0.5
-}
-
 fn pen_tilt(data: &PenData) -> Vec2 {
     if let Some(tilt) = data.tilt {
         return Vec2::new(tilt.x as f32, tilt.y as f32);
@@ -610,10 +1004,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preview_radius_matches_the_engine_pressure_curve() {
+    fn preview_footprint_uses_the_engine_pressure_and_tilt_curve() {
         let profile = StrokeRendererSettings::default().pen;
-        assert_eq!(brush_radius(profile, 1.0), profile.diameter * 0.5);
-        assert!(brush_radius(profile, 0.0) >= profile.diameter * 0.05);
-        assert!(brush_radius(profile, 0.0) < brush_radius(profile, 0.5));
+        let full = profile.footprint(1.0, 0.0);
+        let light = profile.footprint(0.0, 0.0);
+        let tilted = profile.footprint(1.0, 60.0);
+        assert_eq!(full.half_size.x, profile.diameter * 0.5);
+        assert!(light.half_size.x < full.half_size.x);
+        assert!(tilted.half_size.x > tilted.half_size.y);
     }
 }
