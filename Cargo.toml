@@ -1,0 +1,8 @@
+[package]
+name = "stroke_drawing_test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { path = "../../Hamerons_bevy", default-features = false, features = ["2d", "ui", "pen"] }
+hamerons_stroke_render = { path = "../hamerons_stroke_render" }
