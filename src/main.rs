@@ -239,7 +239,10 @@ fn setup(
     mut selector: ResMut<ColorSelector>,
 ) {
     cursor_options.visible = false;
-    commands.spawn(Camera2d);
+    // Stroke coverage is already analytically antialiased in document space.
+    // Multisampling the independently rasterized body/join primitives creates
+    // sample-mask seams when ownership changes at dense input points.
+    commands.spawn((Camera2d, Msaa::Off));
 
     let image = images.add(color_selector_image(&selector));
     selector.image = image.clone();
