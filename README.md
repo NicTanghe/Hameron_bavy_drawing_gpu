@@ -29,6 +29,13 @@ cargo run --release
 - `C`: clear without discarding vector history.
 - `Ctrl+Z`: undo; `Ctrl+Shift+Z` or `Ctrl+Y`: redo.
 - `V`: toggle low-latency presentation and vsync.
+- `Ctrl+S`: checkpoint atomically to `stroke_lab.kra` on a background worker.
+- `Ctrl+O`: validate and load `stroke_lab.kra`.
+- `N`: create and select a normal layer.
+- `Page Up` / `Page Down`: select the layer above or below.
+- `Shift+Page Up` / `Shift+Page Down`: reorder the active layer.
+- `H`: toggle active-layer visibility.
+- `,` / `.`: reduce or increase active-layer opacity.
 
 The cursor's colored ring shows the engine's pressure-adjusted round footprint.
 Its short direction tick reports tablet tilt captured by the engine, although

@@ -11,14 +11,16 @@ use bevy::{
     winit::WinitSettings,
 };
 use hamerons_stroke_render::{
-    BrushProfile, BrushSizeSpace, CanvasTileCache, HameronsStrokeRenderPlugin, StrokeDocument,
-    StrokeId, StrokePoint, StrokeRendererSettings,
+    BrushProfile, BrushSizeSpace, CanvasTileCache, CheckpointRequest, DocumentCheckpointManager,
+    EffectRegistry, HameronsStrokeRenderPlugin, PaintModelRegistry, StrokeDocument, StrokeId,
+    StrokePoint, StrokeRendererSettings,
 };
 
 const START_WIDTH: u32 = 1_200;
 const START_HEIGHT: u32 = 750;
 const MIN_BRUSH_SIZE: f32 = 2.0;
 const MAX_BRUSH_SIZE: f32 = 180.0;
+const DOCUMENT_PATH: &str = "stroke_lab.kra";
 
 fn main() {
     let default_plugins = DefaultPlugins
@@ -48,6 +50,7 @@ fn main() {
         .add_plugins(HameronsStrokeRenderPlugin)
         .init_resource::<PointerState>()
         .init_resource::<MouseStroke>()
+        .init_resource::<DocumentStatus>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
@@ -55,6 +58,7 @@ fn main() {
                 collect_mouse_strokes,
                 observe_pen_pointer,
                 keyboard_shortcuts,
+                poll_document_checkpoint,
                 draw_brush_preview,
                 update_hud,
             )
@@ -148,6 +152,15 @@ struct MouseStroke {
     stroke: Option<StrokeId>,
     tool: Tool,
     last_position: Option<Vec2>,
+}
+
+#[derive(Resource)]
+struct DocumentStatus(String);
+
+impl Default for DocumentStatus {
+    fn default() -> Self {
+        Self("document not saved".into())
+    }
 }
 
 #[derive(Component)]
@@ -341,18 +354,23 @@ fn observe_pen_pointer(mut pen_events: MessageReader<PenInput>, mut pointer: Res
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn keyboard_shortcuts(
     keys: Res<ButtonInput<KeyCode>>,
     mut window: Single<&mut Window, With<PrimaryWindow>>,
     mut settings: ResMut<StrokeRendererSettings>,
     mut document: ResMut<StrokeDocument>,
+    paint_models: Res<PaintModelRegistry>,
+    effects: Res<EffectRegistry>,
+    mut checkpoints: ResMut<DocumentCheckpointManager>,
+    mut document_status: ResMut<DocumentStatus>,
     mut mouse: ResMut<MouseStroke>,
     pointer: Res<PointerState>,
 ) {
     let ctrl = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
     let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
 
-    if keys.just_pressed(KeyCode::KeyC) {
+    if !ctrl && keys.just_pressed(KeyCode::KeyC) {
         document.clear();
         mouse.stroke = None;
         mouse.last_position = None;
@@ -366,6 +384,74 @@ fn keyboard_shortcuts(
     }
     if ctrl && keys.just_pressed(KeyCode::KeyY) {
         document.redo();
+    }
+    if ctrl && keys.just_pressed(KeyCode::KeyS) {
+        document_status.0 = match checkpoints.request(&document, DOCUMENT_PATH) {
+            Ok(CheckpointRequest::Started) => format!("saving {DOCUMENT_PATH} in background"),
+            Ok(CheckpointRequest::Busy) => "save already in progress".into(),
+            Ok(CheckpointRequest::Unchanged) => "document already saved".into(),
+            Err(error) => format!("save failed: {error}"),
+        };
+    }
+    if ctrl && keys.just_pressed(KeyCode::KeyO) {
+        if checkpoints.is_busy() {
+            document_status.0 = "wait for the current save before loading".into();
+        } else {
+            match StrokeDocument::load_kra(DOCUMENT_PATH, &paint_models, &effects) {
+                Ok(loaded) => {
+                    let issues = loaded.compatibility_issues.len();
+                    document.replace_loaded(loaded.document);
+                    mouse.stroke = None;
+                    mouse.last_position = None;
+                    document_status.0 = if issues == 0 {
+                        format!("loaded {DOCUMENT_PATH}")
+                    } else {
+                        format!("loaded {DOCUMENT_PATH} with {issues} compatibility issue(s)")
+                    };
+                }
+                Err(error) => document_status.0 = format!("load failed: {error}"),
+            }
+        }
+    }
+
+    if !ctrl && keys.just_pressed(KeyCode::KeyN) {
+        let number = document.layers().len() + 1;
+        document.add_layer(format!("Layer {number}"));
+    }
+    if !ctrl && keys.just_pressed(KeyCode::KeyH) {
+        let active = document.active_layer();
+        if let Some(visible) = document.layer(active).map(|layer| layer.visible) {
+            document.set_layer_visibility(active, !visible);
+        }
+    }
+    if !ctrl && (keys.just_pressed(KeyCode::PageUp) || keys.just_pressed(KeyCode::PageDown)) {
+        let active = document.active_layer();
+        if let Some(index) = document.layer_index(active) {
+            let target = if keys.just_pressed(KeyCode::PageUp) {
+                (index + 1).min(document.layers().len().saturating_sub(1))
+            } else {
+                index.saturating_sub(1)
+            };
+            if shift {
+                document.move_layer(active, target);
+            } else if let Some(layer) = document.layers().get(target) {
+                let id = layer.id;
+                document.set_active_layer(id);
+            }
+        }
+    }
+    let opacity_delta = if !ctrl && keys.just_pressed(KeyCode::Comma) {
+        -0.1
+    } else if !ctrl && keys.just_pressed(KeyCode::Period) {
+        0.1
+    } else {
+        0.0
+    };
+    if opacity_delta != 0.0 {
+        let active = document.active_layer();
+        if let Some(opacity) = document.layer(active).map(|layer| layer.opacity) {
+            document.set_layer_opacity(active, opacity + opacity_delta);
+        }
     }
 
     let size_delta = if keys.just_pressed(KeyCode::BracketLeft) {
@@ -386,6 +472,22 @@ fn keyboard_shortcuts(
                 PresentMode::AutoVsync
             }
             _ => PresentMode::AutoNoVsync,
+        };
+    }
+}
+
+fn poll_document_checkpoint(
+    mut checkpoints: ResMut<DocumentCheckpointManager>,
+    mut status: ResMut<DocumentStatus>,
+) {
+    if let Some(result) = checkpoints.poll() {
+        status.0 = match result {
+            Ok(report) => format!(
+                "saved {} ({} KiB)",
+                report.path.display(),
+                report.bytes_written.div_ceil(1024)
+            ),
+            Err(error) => format!("save failed: {error}"),
         };
     }
 }
@@ -434,6 +536,7 @@ fn update_hud(
     document: Res<StrokeDocument>,
     tiles: Res<CanvasTileCache>,
     window: Single<&Window, With<PrimaryWindow>>,
+    document_status: Res<DocumentStatus>,
     mut text: Single<&mut Text, With<HudText>>,
 ) {
     let pressure = pointer.pressure.map_or_else(
@@ -443,24 +546,39 @@ fn update_hud(
     let tilt = pointer.tilt.length().clamp(0.0, 90.0);
     let profile = pointer.tool.profile(&settings);
     let cache = tiles.stats();
+    let active_layer = document
+        .layer(document.active_layer())
+        .expect("active layer must exist");
+    let layer_index = document.layer_index(active_layer.id).unwrap_or(0) + 1;
     let presentation = match window.present_mode {
         PresentMode::AutoNoVsync | PresentMode::Immediate | PresentMode::Mailbox => "low latency",
         _ => "vsync",
     };
     let content = format!(
         "HAMERONS STROKE  /  {}  •  {:.0} px  •  pressure {}  •  tilt {:.0}°  •  {}\n\
-         LMB draw   RMB erase   tablet pressure + eraser tip   [ ] size   C clear   Ctrl+Z undo   V {}\n\
-         ENGINE  •  {} strokes  •  {} points  •  {} segments  •  {} resident tiles",
+         LMB/RMB draw/erase   [ ] size   C clear   Ctrl+Z undo   V {}   Ctrl+S/O save/load\n\
+         LAYER {}/{}  •  {}  •  {:.0}%  •  {}   N new   PgUp/Dn select   Shift+Pg move   H hide   , . opacity\n\
+         ENGINE  •  {} strokes  •  {} points  •  {} segments  •  {} resident tiles  •  {}",
         pointer.tool.label(),
         profile.diameter,
         pressure,
         tilt,
         pointer.source.label(),
         presentation,
+        layer_index,
+        document.layers().len(),
+        active_layer.name,
+        active_layer.opacity * 100.0,
+        if active_layer.visible {
+            "visible"
+        } else {
+            "hidden"
+        },
         document.strokes().len(),
         document.points().len(),
         document.segments().len(),
         cache.resident_tiles,
+        document_status.0,
     );
     if text.0 != content {
         text.0 = content;
