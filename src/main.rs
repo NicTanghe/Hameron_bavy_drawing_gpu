@@ -27,6 +27,7 @@ const START_WIDTH: u32 = 1_200;
 const START_HEIGHT: u32 = 750;
 const MIN_BRUSH_SIZE: f32 = 2.0;
 const MAX_BRUSH_SIZE: f32 = 180.0;
+const SIZE_DRAG_SENSITIVITY: f32 = 0.35;
 const DOCUMENT_PATH: &str = "stroke_lab.kra";
 const PICKER_WIDTH: u32 = 270;
 const PICKER_HEIGHT: u32 = 310;
@@ -67,6 +68,7 @@ fn main() {
         .add_plugins(HameronsStrokeRenderPlugin)
         .init_resource::<PointerState>()
         .init_resource::<MouseStroke>()
+        .init_resource::<BrushSizing>()
         .init_resource::<DocumentStatus>()
         .init_resource::<ColorSelector>()
         .add_systems(Startup, setup)
@@ -177,6 +179,62 @@ struct MouseStroke {
     stroke: Option<StrokeId>,
     tool: Tool,
     last_position: Option<Vec2>,
+}
+
+#[derive(Clone, Copy)]
+struct SizeGesture {
+    source: PointerSource,
+    tool: Tool,
+    origin: Vec2,
+    starting_size: f32,
+}
+
+#[derive(Resource, Default)]
+struct BrushSizing {
+    gesture: Option<SizeGesture>,
+}
+
+impl BrushSizing {
+    fn end(&mut self, source: PointerSource) {
+        if self.gesture.is_some_and(|gesture| gesture.source == source) {
+            self.gesture = None;
+        }
+    }
+
+    fn active_for(&self, source: PointerSource) -> bool {
+        self.gesture.is_some_and(|gesture| gesture.source == source)
+    }
+}
+
+fn update_size_gesture(
+    source: PointerSource,
+    tool: Tool,
+    position: Vec2,
+    sizing: &mut BrushSizing,
+    settings: &mut StrokeRendererSettings,
+) {
+    let start_new = sizing
+        .gesture
+        .is_none_or(|gesture| gesture.source != source || gesture.tool != tool);
+    if start_new {
+        sizing.gesture = Some(SizeGesture {
+            source,
+            tool,
+            origin: position,
+            starting_size: tool.profile(settings).diameter,
+        });
+    }
+
+    let gesture = sizing
+        .gesture
+        .expect("a size gesture must exist after initialization");
+    tool.profile_mut(settings).diameter =
+        dragged_brush_size(gesture.starting_size, gesture.origin, position);
+}
+
+fn dragged_brush_size(starting_size: f32, origin: Vec2, position: Vec2) -> f32 {
+    let delta = (position.x - origin.x) - (position.y - origin.y);
+    (starting_size + delta * SIZE_DRAG_SENSITIVITY).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE)
 }
 
 #[derive(Resource)]
@@ -292,9 +350,18 @@ fn setup(
 
 fn update_stroke_input_blocker(
     window: Single<&Window, With<PrimaryWindow>>,
+    keys: Res<ButtonInput<KeyCode>>,
     mut blocker: ResMut<StrokeInputBlocker>,
 ) {
-    blocker.set_regions([picker_rect(&window)]);
+    let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+    if shift {
+        blocker.set_regions([Rect::from_corners(
+            Vec2::ZERO,
+            Vec2::new(window.width(), window.height()),
+        )]);
+    } else {
+        blocker.set_regions([picker_rect(&window)]);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -583,12 +650,14 @@ fn color_byte(value: f32) -> u8 {
 fn collect_mouse_strokes(
     mut cursor_events: MessageReader<CursorMoved>,
     mut cursor_left_events: MessageReader<CursorLeft>,
+    keys: Res<ButtonInput<KeyCode>>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     window: Single<&Window, With<PrimaryWindow>>,
     camera: Single<(&Camera, &GlobalTransform), With<Camera2d>>,
-    settings: Res<StrokeRendererSettings>,
+    mut settings: ResMut<StrokeRendererSettings>,
     mut document: ResMut<StrokeDocument>,
     mut mouse: ResMut<MouseStroke>,
+    mut sizing: ResMut<BrushSizing>,
     mut pointer: ResMut<PointerState>,
     selector: Res<ColorSelector>,
 ) {
@@ -610,9 +679,11 @@ fn collect_mouse_strokes(
     };
     let pressed = mouse_buttons.just_pressed(MouseButton::Left)
         || mouse_buttons.just_pressed(MouseButton::Right);
+    let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
 
     if selector.hovered || selector.drag.is_some() {
         end_mouse_stroke(&mut document, &mut mouse);
+        sizing.end(PointerSource::Mouse);
         return;
     }
 
@@ -623,7 +694,17 @@ fn collect_mouse_strokes(
     if let Some(position) = latest_position {
         pointer.show_mouse(position, tool, down);
 
-        if down {
+        if down && shift {
+            end_mouse_stroke(&mut document, &mut mouse);
+            update_size_gesture(
+                PointerSource::Mouse,
+                tool,
+                position,
+                &mut sizing,
+                &mut settings,
+            );
+        } else if down {
+            sizing.end(PointerSource::Mouse);
             let (camera, camera_transform) = *camera;
             if let Some(point) = mouse_point(
                 position,
@@ -651,6 +732,7 @@ fn collect_mouse_strokes(
         || mouse_buttons.just_released(MouseButton::Right)
     {
         end_mouse_stroke(&mut document, &mut mouse);
+        sizing.end(PointerSource::Mouse);
         if pointer.source == PointerSource::Mouse {
             pointer.down = false;
         }
@@ -658,6 +740,7 @@ fn collect_mouse_strokes(
 
     for _ in cursor_left_events.read() {
         end_mouse_stroke(&mut document, &mut mouse);
+        sizing.end(PointerSource::Mouse);
         if pointer.source == PointerSource::Mouse {
             pointer.position = None;
             pointer.down = false;
@@ -702,7 +785,19 @@ fn mouse_point(
     })
 }
 
-fn observe_pen_pointer(mut pen_events: MessageReader<PenInput>, mut pointer: ResMut<PointerState>) {
+fn observe_pen_pointer(
+    mut pen_events: MessageReader<PenInput>,
+    keys: Res<ButtonInput<KeyCode>>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    mut pointer: ResMut<PointerState>,
+    mut sizing: ResMut<BrushSizing>,
+    mut settings: ResMut<StrokeRendererSettings>,
+) {
+    let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+    if !shift {
+        sizing.end(PointerSource::Tablet);
+    }
+
     for event in pen_events.read() {
         if !event.pen.primary {
             continue;
@@ -722,6 +817,15 @@ fn observe_pen_pointer(mut pen_events: MessageReader<PenInput>, mut pointer: Res
             PenAction::Moved(data) => {
                 if let Some(position) = event.pen.position {
                     pointer.show_pen(position, tool, Some(data));
+                    if pointer.pen_contact && shift && !picker_rect(&window).contains(position) {
+                        update_size_gesture(
+                            PointerSource::Tablet,
+                            tool,
+                            position,
+                            &mut sizing,
+                            &mut settings,
+                        );
+                    }
                 }
             }
             PenAction::Button {
@@ -732,10 +836,23 @@ fn observe_pen_pointer(mut pen_events: MessageReader<PenInput>, mut pointer: Res
                 pointer.pen_contact = state.is_pressed();
                 if let Some(position) = event.pen.position {
                     pointer.show_pen(position, tool, Some(data));
+                    if state.is_pressed() && shift && !picker_rect(&window).contains(position) {
+                        update_size_gesture(
+                            PointerSource::Tablet,
+                            tool,
+                            position,
+                            &mut sizing,
+                            &mut settings,
+                        );
+                    }
+                }
+                if !state.is_pressed() {
+                    sizing.end(PointerSource::Tablet);
                 }
             }
             PenAction::Left => {
                 pointer.pen_contact = false;
+                sizing.end(PointerSource::Tablet);
                 if pointer.source == PointerSource::Tablet {
                     pointer.position = None;
                     pointer.down = false;
@@ -888,10 +1005,14 @@ fn draw_brush_preview(
     mut gizmos: Gizmos,
     window: Single<&Window, With<PrimaryWindow>>,
     pointer: Res<PointerState>,
+    sizing: Res<BrushSizing>,
     settings: Res<StrokeRendererSettings>,
     selector: Res<ColorSelector>,
 ) {
-    if pointer.down || selector.hovered || selector.drag.is_some() {
+    if (pointer.down && !sizing.active_for(pointer.source))
+        || selector.hovered
+        || selector.drag.is_some()
+    {
         return;
     }
     let Some(position) = pointer.position else {
@@ -960,7 +1081,7 @@ fn update_hud(
     };
     let content = format!(
         "HAMERONS STROKE  /  {}  •  {:.0} px  •  pressure {}  •  tilt {:.0}°  •  {}\n\
-         LMB/RMB draw/erase   [ ] size   C clear   Ctrl+Z undo   V {}   Ctrl+S/O save/load\n\
+         LMB/RMB draw/erase   Shift+drag size   [ ] size   C clear   Ctrl+Z undo   V {}   Ctrl+S/O save/load\n\
          LAYER {}/{}  •  {}  •  {:.0}%  •  {}   N new   PgUp/Dn select   Shift+Pg move   H hide   , . opacity\n\
          ENGINE  •  {} strokes  •  {} points  •  {} segments  •  {} resident tiles  •  {}",
         pointer.tool.label(),
@@ -1015,5 +1136,26 @@ mod tests {
         assert_eq!(full.half_size.x, profile.diameter * 0.5);
         assert!(light.half_size.x < full.half_size.x);
         assert!(tilted.half_size.x > tilted.half_size.y);
+    }
+
+    #[test]
+    fn shift_drag_sizes_right_and_up_with_limits() {
+        let origin = Vec2::new(100.0, 100.0);
+        assert_eq!(
+            dragged_brush_size(20.0, origin, Vec2::new(120.0, 100.0)),
+            27.0
+        );
+        assert_eq!(
+            dragged_brush_size(20.0, origin, Vec2::new(100.0, 80.0)),
+            27.0
+        );
+        assert_eq!(
+            dragged_brush_size(20.0, origin, Vec2::new(-1_000.0, 1_000.0)),
+            MIN_BRUSH_SIZE
+        );
+        assert_eq!(
+            dragged_brush_size(20.0, origin, Vec2::new(1_000.0, -1_000.0)),
+            MAX_BRUSH_SIZE
+        );
     }
 }
