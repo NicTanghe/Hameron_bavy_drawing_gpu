@@ -132,7 +132,10 @@ impl PointerState {
 
     fn show_pen(&mut self, position: Vec2, tool: Tool, data: Option<&PenData>) {
         self.position = Some(position);
-        self.pressure = data.and_then(|data| data.pressure).map(normalize_pressure);
+        self.pressure = data.and_then(|data| match data.pressure {
+            Some(PenPressure::Normalized(value)) => Some(value as f32),
+            Some(PenPressure::Calibrated { .. }) | None => None,
+        });
         self.tilt = data.map_or(Vec2::ZERO, pen_tilt);
         self.tool = tool;
         self.source = PointerSource::Tablet;
@@ -465,29 +468,10 @@ fn update_hud(
 }
 
 fn brush_radius(profile: BrushProfile, pressure: f32) -> f32 {
-    let pressure = pressure
-        .clamp(0.0, 1.0)
-        .powf(profile.pressure_gamma.max(0.01));
+    let pressure = pressure.powf(profile.pressure_gamma.max(0.01));
     let minimum = profile.minimum_diameter_ratio.clamp(0.0, 1.0);
     let diameter = profile.diameter.max(0.25) * (minimum + (1.0 - minimum) * pressure);
     diameter * 0.5
-}
-
-fn normalize_pressure(pressure: PenPressure) -> f32 {
-    match pressure {
-        PenPressure::Normalized(value) if value.is_finite() => value as f32,
-        PenPressure::Calibrated {
-            force,
-            max_possible_force,
-        } if force.is_finite()
-            && max_possible_force.is_finite()
-            && max_possible_force > f64::EPSILON =>
-        {
-            (force / max_possible_force) as f32
-        }
-        _ => 1.0,
-    }
-    .clamp(0.0, 1.0)
 }
 
 fn pen_tilt(data: &PenData) -> Vec2 {
@@ -513,17 +497,5 @@ mod tests {
         assert_eq!(brush_radius(profile, 1.0), profile.diameter * 0.5);
         assert!(brush_radius(profile, 0.0) >= profile.diameter * 0.05);
         assert!(brush_radius(profile, 0.0) < brush_radius(profile, 0.5));
-    }
-
-    #[test]
-    fn pressure_is_normalized_and_clamped() {
-        assert_eq!(normalize_pressure(PenPressure::Normalized(4.0)), 1.0);
-        assert_eq!(
-            normalize_pressure(PenPressure::Calibrated {
-                force: 256.0,
-                max_possible_force: 1024.0,
-            }),
-            0.25
-        );
     }
 }
