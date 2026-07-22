@@ -1,17 +1,16 @@
-# Hamerons Stroke Lab
+# Stroke Drawing Test
 
-A small pressure-sensitive drawing test for the local
-`hamerons_stroke_render` crate. The visual shell follows the earlier
-`drawing_test`: a paper-colored full-window canvas, low-latency presentation,
-a live brush outline, and a compact status HUD.
+A pressure-sensitive drawing test for the local `hamerons_stroke_render` and
+`vector_stroke_render` crates. The app starts in a renderer menu and uses Bevy
+states to activate exactly one backend at a time:
 
-Unlike the earlier prototype, this app does not contain a paint canvas, CPU
-pixel buffer, tile uploader, shader, or custom render pipeline. It installs
-`HameronsStrokeRenderPlugin`; the engine owns stroke history, the active GPU
-overlay, persistent tile replay, erasing, and cache diagnostics. The only
-input implemented by the app is a small mouse fallback that appends geometry to
-the engine's public `StrokeDocument` API. Tablet input goes directly through the
-engine's pen adapter.
+- **Hamerons Paint Renderer** uses the existing GPU paint/tile backend and
+  persists documents as `stroke_lab.kra`.
+- **Vector Stroke Renderer** keeps editable pressure-sensitive stroke paths and
+  persists them as `stroke_lab.ink.json`.
+
+Both documents remain in memory when returning to the menu, so switching
+renderers does not mix their output or throw away the current session.
 
 ## Run
 
@@ -21,27 +20,28 @@ cargo run --release
 
 ## Controls
 
+- Menu: choose a renderer with its button or press `1` / `2`.
 - Tablet pen contact: draw with pressure and tilt.
 - Tablet eraser tip: erase.
-- Left mouse drag: draw through the engine's document API.
-- Right mouse drag: erase through the engine's document API.
+- Left mouse drag: draw.
+- Right mouse drag: erase.
+- `Shift` + drag: change active tool size.
 - `[` / `]`: decrease or increase the active tool size.
-- `C`: clear without discarding vector history.
+- `C`: clear the current canvas.
 - `Ctrl+Z`: undo; `Ctrl+Shift+Z` or `Ctrl+Y`: redo.
 - `V`: toggle low-latency presentation and vsync.
-- `Ctrl+S`: checkpoint atomically to `stroke_lab.kra` on a background worker.
-- `Ctrl+O`: validate and load `stroke_lab.kra`.
+- `Ctrl+S` / `Ctrl+O`: save or load the selected backend's document format.
 - `N`: create and select a normal layer.
 - `Page Up` / `Page Down`: select the layer above or below.
 - `Shift+Page Up` / `Shift+Page Down`: reorder the active layer.
 - `H`: toggle active-layer visibility.
 - `,` / `.`: reduce or increase active-layer opacity.
+- `Escape`: return to the renderer menu.
 
 The advanced color selector at the upper right uses a hue ring and a
 saturation/value triangle. Drag either with the mouse or tablet pen; releasing
 commits an immutable material for subsequent strokes.
 
-The cursor outline uses the same pressure/tilt footprint as the engine. The tip
-stays circular through 35 degrees of tilt, then progressively becomes an oval
-through 75 degrees. Only the feather-light bottom 15 percent of normalized pen
-pressure reduces deposition opacity; firmer input remains fully opaque.
+The Hamerons preview uses its pressure/tilt brush footprint. The vector preview
+shows the pressure-adjusted path width; pressure and tilt samples are retained
+in the JSON document for later editing or export.
