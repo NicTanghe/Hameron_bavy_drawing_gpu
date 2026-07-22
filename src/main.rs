@@ -20,7 +20,7 @@ use hamerons_stroke_render::{
     BrushProfile, BrushSizeSpace, CanvasTileCache, CheckpointRequest, DocumentCheckpointManager,
     EffectRegistry, HameronsStrokeRenderPlugin, PaintModelRegistry, RgbaMaterial, RgbaPaintModel,
     StrokeDocument, StrokeId, StrokeInputBlocker, StrokeInputSystems, StrokePoint,
-    StrokeRendererSettings,
+    StrokePointResampler, StrokeRendererSettings,
 };
 
 const START_WIDTH: u32 = 1_200;
@@ -178,7 +178,7 @@ impl PointerState {
 struct MouseStroke {
     stroke: Option<StrokeId>,
     tool: Tool,
-    last_point: Option<StrokePoint>,
+    resampler: Option<StrokePointResampler>,
 }
 
 #[derive(Clone, Copy)]
@@ -661,11 +661,13 @@ fn collect_mouse_strokes(
     mut pointer: ResMut<PointerState>,
     selector: Res<ColorSelector>,
 ) {
-    let mut latest_position = pointer
-        .position
-        .filter(|_| pointer.source == PointerSource::Mouse);
-    for event in cursor_events.read() {
-        latest_position = Some(event.position);
+    let mut positions: Vec<_> = cursor_events.read().map(|event| event.position).collect();
+    if positions.is_empty()
+        && let Some(position) = pointer
+            .position
+            .filter(|_| pointer.source == PointerSource::Mouse)
+    {
+        positions.push(position);
     }
 
     let down =
@@ -691,7 +693,7 @@ fn collect_mouse_strokes(
         end_mouse_stroke(&mut document, &mut mouse);
     }
 
-    if let Some(position) = latest_position {
+    for position in positions {
         pointer.show_mouse(position, tool, down);
 
         if down && shift {
@@ -714,18 +716,16 @@ fn collect_mouse_strokes(
                 &window,
             ) {
                 if let Some(stroke) = mouse.stroke {
-                    if mouse
-                        .last_point
-                        .is_none_or(|previous| sample_is_spaced(previous, point))
-                    {
-                        document.append_point(stroke, point);
-                        mouse.last_point = Some(point);
+                    if let Some(resampler) = &mut mouse.resampler {
+                        resampler.push(point, |point| {
+                            document.append_point(stroke, point);
+                        });
                     }
                 } else {
                     let (stroke, _) = document.begin_stroke(point, tool.profile(&settings));
                     mouse.stroke = Some(stroke);
                     mouse.tool = tool;
-                    mouse.last_point = Some(point);
+                    mouse.resampler = Some(StrokePointResampler::new(point));
                 }
             }
         }
@@ -754,15 +754,14 @@ fn collect_mouse_strokes(
 
 fn end_mouse_stroke(document: &mut StrokeDocument, mouse: &mut MouseStroke) {
     if let Some(stroke) = mouse.stroke.take() {
+        if let Some(mut resampler) = mouse.resampler.take() {
+            resampler.finish(|point| {
+                document.append_point(stroke, point);
+            });
+        }
         document.end_stroke(stroke);
     }
-    mouse.last_point = None;
-}
-
-fn sample_is_spaced(previous: StrokePoint, current: StrokePoint) -> bool {
-    let previous_spacing = (previous.half_width * 0.32).max(0.7);
-    let current_spacing = (current.half_width * 0.32).max(0.7);
-    previous.position.distance(current.position) >= previous_spacing.min(current_spacing)
+    mouse.resampler = None;
 }
 
 fn mouse_point(
@@ -892,7 +891,7 @@ fn keyboard_shortcuts(
     if !ctrl && keys.just_pressed(KeyCode::KeyC) {
         document.clear();
         mouse.stroke = None;
-        mouse.last_point = None;
+        mouse.resampler = None;
     }
     if ctrl && keys.just_pressed(KeyCode::KeyZ) {
         if shift {
@@ -921,7 +920,7 @@ fn keyboard_shortcuts(
                     let issues = loaded.compatibility_issues.len();
                     document.replace_loaded(loaded.document);
                     mouse.stroke = None;
-                    mouse.last_point = None;
+                    mouse.resampler = None;
                     document_status.0 = if issues == 0 {
                         format!("loaded {DOCUMENT_PATH}")
                     } else {
@@ -1121,14 +1120,18 @@ fn update_hud(
 }
 
 fn pen_tilt(data: &PenData) -> Vec2 {
-    if let Some(tilt) = data.tilt {
-        return Vec2::new(tilt.x as f32, tilt.y as f32);
-    }
     if let Some(angle) = data.angle {
         let magnitude = (std::f64::consts::FRAC_PI_2 - angle.altitude)
             .to_degrees()
             .clamp(0.0, 90.0) as f32;
         return Vec2::from_angle(angle.azimuth as f32) * magnitude;
+    }
+    if let Some(tilt) = data.tilt {
+        let projection = Vec2::new(
+            (tilt.x as f32).to_radians().tan(),
+            (tilt.y as f32).to_radians().tan(),
+        );
+        return projection.normalize_or_zero() * projection.length().atan().to_degrees();
     }
     Vec2::ZERO
 }
@@ -1136,6 +1139,7 @@ fn pen_tilt(data: &PenData) -> Vec2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::input::pen::PenTilt;
 
     #[test]
     fn preview_footprint_uses_the_engine_pressure_and_tilt_curve() {
@@ -1146,6 +1150,18 @@ mod tests {
         assert_eq!(full.half_size.x, profile.diameter * 0.5);
         assert!(light.half_size.x < full.half_size.x);
         assert!(tilted.half_size.x > tilted.half_size.y);
+    }
+
+    #[test]
+    fn preview_tilt_uses_winit_plane_angles() {
+        let data = PenData {
+            tilt: Some(PenTilt { x: 30, y: 40 }),
+            ..Default::default()
+        };
+        let projection = Vec2::new(30.0_f32.to_radians().tan(), 40.0_f32.to_radians().tan());
+        let expected = projection.normalize_or_zero() * projection.length().atan().to_degrees();
+
+        assert!(pen_tilt(&data).abs_diff_eq(expected, 0.0001));
     }
 
     #[test]
