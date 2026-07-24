@@ -18,10 +18,12 @@ use bevy::{
 };
 use hamerons_stroke_render::{
     BrushProfile, BrushSizeSpace, CanvasTileCache, CheckpointRequest, DocumentCheckpointManager,
-    EffectRegistry, HameronsStrokeRenderPlugin, PaintModelRegistry, RgbaMaterial, RgbaPaintModel,
-    StrokeDocument as PaintStrokeDocument, StrokeId, StrokeInputBlocker,
-    StrokeInputSystems as PaintStrokeInputSystems, StrokePoint, StrokePointResampler,
-    StrokeRendererSettings,
+    EffectNodeId, EffectRegistry, HameronsStrokeRenderPlugin, LayerId as PaintLayerId,
+    PIGMENT_PAINT_MODEL_ID, PaintMaterialRef, PaintModelRegistry, PigmentMaterial,
+    PigmentPaintModel, RGBA_PAINT_MODEL_ID, RgbaMaterial, RgbaPaintModel, SMEAR_EFFECT_ID,
+    SMEAR_EFFECT_VERSION, SmearParameters, StrokeDocument as PaintStrokeDocument, StrokeId,
+    StrokeInputBlocker, StrokeInputMode, StrokeInputSystems as PaintStrokeInputSystems,
+    StrokePoint, StrokePointResampler, StrokeRendererSettings,
 };
 use vector_stroke_render::{
     CanvasExtent, DocumentLimits, Srgba8, StrokeDocument as VectorStrokeDocument,
@@ -48,6 +50,11 @@ const PICKER_RING_OUTER: f32 = 111.0;
 const PICKER_BLACK: Vec2 = Vec2::new(135.0, 62.0);
 const PICKER_WHITE: Vec2 = Vec2::new(74.0, 185.0);
 const PICKER_HUE: Vec2 = Vec2::new(196.0, 185.0);
+const PANEL_MARGIN: f32 = 14.0;
+const PANEL_WIDTH: f32 = 270.0;
+const LAYER_PANEL_TOP: f32 = PICKER_TOP + PICKER_HEIGHT as f32 + 12.0;
+const BRUSH_PANEL_TOP: f32 = 142.0;
+const BRUSH_PANEL_HEIGHT: f32 = 322.0;
 
 fn main() {
     let default_plugins = DefaultPlugins
@@ -86,6 +93,7 @@ fn main() {
         .init_resource::<ColorSelector>()
         .init_resource::<VectorSession>()
         .init_resource::<PaintSession>()
+        .init_resource::<PaintPanelState>()
         .add_systems(Startup, setup_camera)
         .add_systems(OnEnter(LabState::Menu), setup_renderer_menu)
         .add_systems(
@@ -112,6 +120,11 @@ fn main() {
         .add_systems(
             Update,
             (
+                update_paint_panel_hover,
+                paint_panel_interaction,
+                refresh_paint_layer_rows,
+                update_paint_panel_readouts,
+                update_paint_panel_button_colors,
                 observe_pen_pointer,
                 collect_mouse_strokes,
                 keyboard_shortcuts,
@@ -181,10 +194,83 @@ struct PaintSession {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PaintMix {
+    #[default]
+    Normal,
+    Pigment,
+}
+
+impl PaintMix {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "NORMAL",
+            Self::Pigment => "PIGMENT",
+        }
+    }
+}
+
+#[derive(Resource)]
+struct PaintPanelState {
+    mix: PaintMix,
+    selected_tool: Tool,
+    pigment_wetness: f32,
+    hovered: bool,
+}
+
+impl Default for PaintPanelState {
+    fn default() -> Self {
+        Self {
+            mix: PaintMix::Normal,
+            selected_tool: Tool::Pen,
+            pigment_wetness: 0.88,
+            hovered: false,
+        }
+    }
+}
+
+#[derive(Component)]
+struct PaintLayerList;
+
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+enum PaintPanelAction {
+    SelectLayer(PaintLayerId),
+    NewLayer,
+    ToggleLayerVisibility,
+    MoveLayerUp,
+    MoveLayerDown,
+    DecreaseLayerOpacity,
+    IncreaseLayerOpacity,
+    SetMix(PaintMix),
+    SetTool(Tool),
+    DecreaseBrushSize,
+    IncreaseBrushSize,
+    DecreaseBrushFlow,
+    IncreaseBrushFlow,
+    DecreasePigmentWetness,
+    IncreasePigmentWetness,
+    ToggleSmear,
+    DecreaseSmearStrength,
+    IncreaseSmearStrength,
+}
+
+#[derive(Component)]
+struct PaintPanelButton(PaintPanelAction);
+
+#[derive(Component, Clone, Copy)]
+enum PaintPanelReadout {
+    BrushSize,
+    BrushFlow,
+    PigmentWetness,
+    Smear,
+    SmearStrength,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Tool {
     #[default]
     Pen,
     Eraser,
+    Smear,
 }
 
 impl Tool {
@@ -192,6 +278,7 @@ impl Tool {
         match self {
             Self::Pen => "PEN",
             Self::Eraser => "ERASER",
+            Self::Smear => "SMEAR",
         }
     }
 
@@ -199,6 +286,7 @@ impl Tool {
         match self {
             Self::Pen => settings.pen,
             Self::Eraser => settings.eraser,
+            Self::Smear => settings.smear,
         }
     }
 
@@ -206,6 +294,7 @@ impl Tool {
         match self {
             Self::Pen => &mut settings.pen,
             Self::Eraser => &mut settings.eraser,
+            Self::Smear => &mut settings.smear,
         }
     }
 }
@@ -540,6 +629,8 @@ fn enter_hamerons_mode(
     mut selector: ResMut<ColorSelector>,
     mut document: ResMut<PaintStrokeDocument>,
     mut session: ResMut<PaintSession>,
+    panel: Res<PaintPanelState>,
+    mut input_mode: ResMut<StrokeInputMode>,
 ) {
     cursor_options.visible = false;
     window.title = "Stroke Drawing Test — Hamerons Paint Renderer".into();
@@ -547,6 +638,7 @@ fn enter_hamerons_mode(
     if let Some(stored) = session.document.take() {
         document.replace_loaded(stored);
     }
+    *input_mode = stroke_input_mode(panel.selected_tool);
     spawn_drawing_ui(
         &mut commands,
         &mut images,
@@ -554,6 +646,7 @@ fn enter_hamerons_mode(
         LabState::Hamerons,
         "HAMERONS PAINT  /  READY",
     );
+    spawn_paint_panels(&mut commands);
 }
 
 fn leave_hamerons_mode(
@@ -562,6 +655,7 @@ fn leave_hamerons_mode(
     mut mouse: ResMut<MouseStroke>,
     mut pointer: ResMut<PointerState>,
     mut selector: ResMut<ColorSelector>,
+    mut panel: ResMut<PaintPanelState>,
 ) {
     end_mouse_stroke(&mut document, &mut mouse);
     let mut stored = PaintStrokeDocument::default();
@@ -571,6 +665,7 @@ fn leave_hamerons_mode(
     *pointer = default();
     selector.drag = None;
     selector.hovered = false;
+    panel.hovered = false;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -710,6 +805,792 @@ fn spawn_drawing_ui(
     ));
 }
 
+fn spawn_paint_panels(commands: &mut Commands) {
+    commands
+        .spawn((
+            DespawnOnExit(LabState::Hamerons),
+            Node {
+                position_type: PositionType::Absolute,
+                top: px(LAYER_PANEL_TOP),
+                right: px(PANEL_MARGIN),
+                bottom: px(PANEL_MARGIN),
+                width: px(PANEL_WIDTH),
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
+                row_gap: px(7),
+                padding: UiRect::all(px(12)),
+                border: UiRect::all(px(1)),
+                border_radius: BorderRadius::all(px(8)),
+                ..default()
+            },
+            BorderColor::all(Color::srgba(0.45, 0.52, 0.66, 0.5)),
+            BackgroundColor(Color::srgba(0.055, 0.065, 0.085, 0.94)),
+        ))
+        .with_children(|panel| {
+            spawn_panel_heading(panel, "LAYERS");
+            panel.spawn((
+                Text::new("PAINT MIX"),
+                TextFont::from_font_size(11.0),
+                TextColor(Color::srgb_u8(145, 155, 174)),
+            ));
+            panel
+                .spawn(Node {
+                    width: percent(100),
+                    display: Display::Flex,
+                    column_gap: px(7),
+                    ..default()
+                })
+                .with_children(|row| {
+                    spawn_paint_panel_button(
+                        row,
+                        PaintPanelAction::SetMix(PaintMix::Normal),
+                        "NORMAL",
+                        percent(50),
+                    );
+                    spawn_paint_panel_button(
+                        row,
+                        PaintPanelAction::SetMix(PaintMix::Pigment),
+                        "PIGMENT",
+                        percent(50),
+                    );
+                });
+            panel.spawn((
+                Node {
+                    width: percent(100),
+                    height: px(1),
+                    margin: UiRect::vertical(px(3)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.5, 0.56, 0.68, 0.28)),
+            ));
+            panel.spawn((
+                PaintLayerList,
+                Node {
+                    width: percent(100),
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Column,
+                    flex_grow: 1.0,
+                    row_gap: px(5),
+                    overflow: Overflow::clip(),
+                    ..default()
+                },
+            ));
+            panel
+                .spawn(Node {
+                    width: percent(100),
+                    display: Display::Flex,
+                    column_gap: px(6),
+                    ..default()
+                })
+                .with_children(|row| {
+                    spawn_paint_panel_button(
+                        row,
+                        PaintPanelAction::NewLayer,
+                        "+ LAYER",
+                        percent(42),
+                    );
+                    spawn_paint_panel_button(
+                        row,
+                        PaintPanelAction::ToggleLayerVisibility,
+                        "SHOW/HIDE",
+                        percent(58),
+                    );
+                });
+            panel
+                .spawn(Node {
+                    width: percent(100),
+                    display: Display::Flex,
+                    column_gap: px(6),
+                    ..default()
+                })
+                .with_children(|row| {
+                    spawn_paint_panel_button(
+                        row,
+                        PaintPanelAction::MoveLayerDown,
+                        "MOVE DOWN",
+                        percent(50),
+                    );
+                    spawn_paint_panel_button(
+                        row,
+                        PaintPanelAction::MoveLayerUp,
+                        "MOVE UP",
+                        percent(50),
+                    );
+                });
+            panel
+                .spawn(Node {
+                    width: percent(100),
+                    display: Display::Flex,
+                    column_gap: px(6),
+                    ..default()
+                })
+                .with_children(|row| {
+                    spawn_paint_panel_button(
+                        row,
+                        PaintPanelAction::DecreaseLayerOpacity,
+                        "OPACITY -",
+                        percent(50),
+                    );
+                    spawn_paint_panel_button(
+                        row,
+                        PaintPanelAction::IncreaseLayerOpacity,
+                        "OPACITY +",
+                        percent(50),
+                    );
+                });
+        });
+
+    commands
+        .spawn((
+            DespawnOnExit(LabState::Hamerons),
+            Node {
+                position_type: PositionType::Absolute,
+                top: px(BRUSH_PANEL_TOP),
+                left: px(PANEL_MARGIN),
+                width: px(PANEL_WIDTH),
+                height: px(BRUSH_PANEL_HEIGHT),
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
+                row_gap: px(8),
+                padding: UiRect::all(px(12)),
+                border: UiRect::all(px(1)),
+                border_radius: BorderRadius::all(px(8)),
+                ..default()
+            },
+            BorderColor::all(Color::srgba(0.45, 0.52, 0.66, 0.5)),
+            BackgroundColor(Color::srgba(0.055, 0.065, 0.085, 0.94)),
+        ))
+        .with_children(|panel| {
+            spawn_panel_heading(panel, "BRUSH");
+            panel
+                .spawn(Node {
+                    width: percent(100),
+                    display: Display::Flex,
+                    column_gap: px(7),
+                    ..default()
+                })
+                .with_children(|row| {
+                    spawn_paint_panel_button(
+                        row,
+                        PaintPanelAction::SetTool(Tool::Pen),
+                        "PAINT",
+                        percent(34),
+                    );
+                    spawn_paint_panel_button(
+                        row,
+                        PaintPanelAction::SetTool(Tool::Eraser),
+                        "ERASER",
+                        percent(33),
+                    );
+                    spawn_paint_panel_button(
+                        row,
+                        PaintPanelAction::SetTool(Tool::Smear),
+                        "SMEAR",
+                        percent(33),
+                    );
+                });
+            spawn_paint_control_row(
+                panel,
+                "SIZE",
+                PaintPanelReadout::BrushSize,
+                PaintPanelAction::DecreaseBrushSize,
+                PaintPanelAction::IncreaseBrushSize,
+            );
+            spawn_paint_control_row(
+                panel,
+                "FLOW",
+                PaintPanelReadout::BrushFlow,
+                PaintPanelAction::DecreaseBrushFlow,
+                PaintPanelAction::IncreaseBrushFlow,
+            );
+            spawn_paint_control_row(
+                panel,
+                "PIGMENT WETNESS",
+                PaintPanelReadout::PigmentWetness,
+                PaintPanelAction::DecreasePigmentWetness,
+                PaintPanelAction::IncreasePigmentWetness,
+            );
+            panel
+                .spawn(Node {
+                    width: percent(100),
+                    display: Display::Flex,
+                    align_items: AlignItems::Center,
+                    column_gap: px(7),
+                    ..default()
+                })
+                .with_children(|row| {
+                    row.spawn((
+                        PaintPanelReadout::Smear,
+                        Text::new("GLOBAL SMEAR"),
+                        TextFont::from_font_size(12.0),
+                        TextColor(Color::srgb_u8(185, 194, 210)),
+                        Node {
+                            flex_grow: 1.0,
+                            ..default()
+                        },
+                    ));
+                    spawn_paint_panel_button(row, PaintPanelAction::ToggleSmear, "TOGGLE", px(88));
+                });
+            spawn_paint_control_row(
+                panel,
+                "GLOBAL STRENGTH",
+                PaintPanelReadout::SmearStrength,
+                PaintPanelAction::DecreaseSmearStrength,
+                PaintPanelAction::IncreaseSmearStrength,
+            );
+            panel.spawn((
+                Text::new("SMEAR drags wet pigment only; GLOBAL SMEAR affects the whole surface."),
+                TextFont::from_font_size(10.0),
+                TextColor(Color::srgb_u8(117, 129, 151)),
+                Node {
+                    margin: UiRect::top(px(2)),
+                    ..default()
+                },
+            ));
+        });
+}
+
+fn spawn_panel_heading(parent: &mut ChildSpawnerCommands, label: &'static str) {
+    parent.spawn((
+        Text::new(label),
+        TextFont::from_font_size(16.0),
+        TextColor(Color::srgb_u8(235, 239, 247)),
+        Node {
+            margin: UiRect::bottom(px(1)),
+            ..default()
+        },
+    ));
+}
+
+fn spawn_paint_panel_button(
+    parent: &mut ChildSpawnerCommands,
+    action: PaintPanelAction,
+    label: impl Into<String>,
+    width: Val,
+) {
+    parent
+        .spawn((
+            Button,
+            PaintPanelButton(action),
+            Node {
+                width,
+                min_height: px(29),
+                display: Display::Flex,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                padding: UiRect::axes(px(7), px(4)),
+                border: UiRect::all(px(1)),
+                border_radius: BorderRadius::all(px(5)),
+                ..default()
+            },
+            BorderColor::all(Color::srgba(0.42, 0.50, 0.64, 0.45)),
+            BackgroundColor(panel_button_color(false, Interaction::None)),
+        ))
+        .with_child((
+            Text::new(label),
+            TextFont::from_font_size(11.0),
+            TextColor(Color::srgb_u8(222, 227, 237)),
+        ));
+}
+
+fn spawn_paint_control_row(
+    parent: &mut ChildSpawnerCommands,
+    label: &'static str,
+    readout: PaintPanelReadout,
+    decrease: PaintPanelAction,
+    increase: PaintPanelAction,
+) {
+    parent
+        .spawn(Node {
+            width: percent(100),
+            display: Display::Flex,
+            align_items: AlignItems::Center,
+            column_gap: px(7),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                readout,
+                Text::new(label),
+                TextFont::from_font_size(12.0),
+                TextColor(Color::srgb_u8(185, 194, 210)),
+                Node {
+                    flex_grow: 1.0,
+                    ..default()
+                },
+            ));
+            spawn_paint_panel_button(row, decrease, "-", px(34));
+            spawn_paint_panel_button(row, increase, "+", px(34));
+        });
+}
+
+fn update_paint_panel_hover(
+    window: Single<&Window, With<PrimaryWindow>>,
+    mut panel: ResMut<PaintPanelState>,
+) {
+    panel.hovered = window.cursor_position().is_some_and(|position| {
+        layer_panel_rect(&window).contains(position) || brush_panel_rect().contains(position)
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_panel_interaction(
+    mut pen_events: MessageReader<PenInput>,
+    changed_buttons: Query<(&Interaction, &PaintPanelButton), Changed<Interaction>>,
+    panel_buttons: Query<(&PaintPanelButton, &ComputedNode, &UiGlobalTransform)>,
+    mut panel: ResMut<PaintPanelState>,
+    mut settings: ResMut<StrokeRendererSettings>,
+    mut input_mode: ResMut<StrokeInputMode>,
+    mut document: ResMut<PaintStrokeDocument>,
+    mut pointer: ResMut<PointerState>,
+    mut mouse: ResMut<MouseStroke>,
+    selector: Res<ColorSelector>,
+    mut rgba: ResMut<RgbaPaintModel>,
+    mut pigment: ResMut<PigmentPaintModel>,
+    mut status: ResMut<DocumentStatus>,
+) {
+    let mut actions = Vec::new();
+    actions.extend(changed_buttons.iter().filter_map(|(interaction, button)| {
+        (*interaction == Interaction::Pressed).then_some(button.0)
+    }));
+
+    let pen_presses: Vec<_> = pen_events
+        .read()
+        .filter_map(|event| {
+            (event.pen.primary
+                && matches!(
+                    &event.action,
+                    PenAction::Button {
+                        button: PenButton::Contact,
+                        state,
+                        ..
+                    } if state.is_pressed()
+                ))
+            .then_some(event.pen.position)
+            .flatten()
+        })
+        .collect();
+    for position in pen_presses {
+        actions.extend(
+            panel_buttons
+                .iter()
+                .filter_map(|(button, node, transform)| {
+                    node.contains_point(*transform, position)
+                        .then_some(button.0)
+                }),
+        );
+    }
+    actions.dedup();
+
+    for action in actions {
+        end_mouse_stroke(&mut document, &mut mouse);
+        match action {
+            PaintPanelAction::SelectLayer(layer) => {
+                document.set_active_layer(layer);
+            }
+            PaintPanelAction::NewLayer => {
+                let number = document.layers().len() + 1;
+                document.add_layer(format!("Layer {number}"));
+            }
+            PaintPanelAction::ToggleLayerVisibility => {
+                let active = document.active_layer();
+                if let Some(visible) = document.layer(active).map(|layer| layer.visible) {
+                    document.set_layer_visibility(active, !visible);
+                }
+            }
+            PaintPanelAction::MoveLayerUp => {
+                move_active_paint_layer(&mut document, 1);
+            }
+            PaintPanelAction::MoveLayerDown => {
+                move_active_paint_layer(&mut document, -1);
+            }
+            PaintPanelAction::DecreaseLayerOpacity => {
+                change_active_layer_opacity(&mut document, -0.1);
+            }
+            PaintPanelAction::IncreaseLayerOpacity => {
+                change_active_layer_opacity(&mut document, 0.1);
+            }
+            PaintPanelAction::SetMix(mix) => {
+                let model = paint_mix_model(mix);
+                if document
+                    .strokes()
+                    .iter()
+                    .any(|stroke| stroke.brush.paint.model != model)
+                {
+                    status.0 =
+                        "paint mix unchanged: one paint model is supported per document".into();
+                } else {
+                    panel.mix = mix;
+                    apply_selected_paint_material(
+                        &panel,
+                        &selector,
+                        &mut settings,
+                        &mut rgba,
+                        &mut pigment,
+                    );
+                    if mix == PaintMix::Normal && panel.selected_tool == Tool::Smear {
+                        panel.selected_tool = Tool::Pen;
+                        pointer.tool = Tool::Pen;
+                        *input_mode = StrokeInputMode::Paint;
+                    }
+                }
+            }
+            PaintPanelAction::SetTool(tool) => {
+                if tool == Tool::Smear && panel.mix != PaintMix::Pigment {
+                    if document
+                        .strokes()
+                        .iter()
+                        .any(|stroke| stroke.brush.paint.model != PIGMENT_PAINT_MODEL_ID)
+                    {
+                        status.0 =
+                            "smear needs a pigment document; the current normal strokes are unchanged"
+                                .into();
+                        continue;
+                    }
+                    panel.mix = PaintMix::Pigment;
+                    apply_selected_paint_material(
+                        &panel,
+                        &selector,
+                        &mut settings,
+                        &mut rgba,
+                        &mut pigment,
+                    );
+                }
+                panel.selected_tool = tool;
+                pointer.tool = tool;
+                *input_mode = stroke_input_mode(tool);
+            }
+            PaintPanelAction::DecreaseBrushSize => {
+                change_brush_size(panel.selected_tool, &mut settings, -2.0);
+            }
+            PaintPanelAction::IncreaseBrushSize => {
+                change_brush_size(panel.selected_tool, &mut settings, 2.0);
+            }
+            PaintPanelAction::DecreaseBrushFlow => {
+                change_brush_flow(panel.selected_tool, &mut settings, -0.05);
+            }
+            PaintPanelAction::IncreaseBrushFlow => {
+                change_brush_flow(panel.selected_tool, &mut settings, 0.05);
+            }
+            PaintPanelAction::DecreasePigmentWetness => {
+                panel.pigment_wetness = (panel.pigment_wetness - 0.05).clamp(0.0, 1.0);
+                if panel.mix == PaintMix::Pigment {
+                    apply_selected_paint_material(
+                        &panel,
+                        &selector,
+                        &mut settings,
+                        &mut rgba,
+                        &mut pigment,
+                    );
+                }
+            }
+            PaintPanelAction::IncreasePigmentWetness => {
+                panel.pigment_wetness = (panel.pigment_wetness + 0.05).clamp(0.0, 1.0);
+                if panel.mix == PaintMix::Pigment {
+                    apply_selected_paint_material(
+                        &panel,
+                        &selector,
+                        &mut settings,
+                        &mut rgba,
+                        &mut pigment,
+                    );
+                }
+            }
+            PaintPanelAction::ToggleSmear => {
+                toggle_smear_effect(&mut document);
+            }
+            PaintPanelAction::DecreaseSmearStrength => {
+                change_smear_strength(&mut document, -0.05);
+            }
+            PaintPanelAction::IncreaseSmearStrength => {
+                change_smear_strength(&mut document, 0.05);
+            }
+        }
+    }
+}
+
+fn refresh_paint_layer_rows(
+    mut commands: Commands,
+    document: Res<PaintStrokeDocument>,
+    lists: Query<Entity, With<PaintLayerList>>,
+    mut fingerprint: Local<Option<(Entity, String)>>,
+) {
+    let Ok(list) = lists.single() else {
+        return;
+    };
+    let next_fingerprint = format!("{:?}:{:?}", document.active_layer(), document.layers());
+    if fingerprint
+        .as_ref()
+        .is_some_and(|(entity, value)| *entity == list && *value == next_fingerprint)
+    {
+        return;
+    }
+    *fingerprint = Some((list, next_fingerprint));
+
+    commands
+        .entity(list)
+        .despawn_children()
+        .with_children(|parent| {
+            for (index, layer) in document.layers().iter().enumerate().rev() {
+                let visibility = if layer.visible { "[x]" } else { "[ ]" };
+                let label = format!(
+                    "{visibility}  {}  /  {:.0}%  /  #{}",
+                    layer.name,
+                    layer.opacity * 100.0,
+                    index + 1
+                );
+                spawn_paint_panel_button(
+                    parent,
+                    PaintPanelAction::SelectLayer(layer.id),
+                    label,
+                    percent(100),
+                );
+            }
+        });
+}
+
+fn update_paint_panel_readouts(
+    panel: Res<PaintPanelState>,
+    settings: Res<StrokeRendererSettings>,
+    document: Res<PaintStrokeDocument>,
+    mut readouts: Query<(&PaintPanelReadout, &mut Text)>,
+) {
+    let profile = panel.selected_tool.profile(&settings);
+    let smear = smear_effect(&document);
+    for (readout, mut text) in &mut readouts {
+        let content = match readout {
+            PaintPanelReadout::BrushSize => format!("SIZE  {:.0} px", profile.diameter),
+            PaintPanelReadout::BrushFlow => format!("FLOW  {:.0}%", profile.flow * 100.0),
+            PaintPanelReadout::PigmentWetness => {
+                format!("PIGMENT WETNESS  {:.0}%", panel.pigment_wetness * 100.0)
+            }
+            PaintPanelReadout::Smear => format!(
+                "GLOBAL SMEAR  {}",
+                if smear.is_some_and(|(_, _, enabled)| enabled) {
+                    "ON"
+                } else {
+                    "OFF"
+                }
+            ),
+            PaintPanelReadout::SmearStrength => format!(
+                "GLOBAL STRENGTH  {:.0}%",
+                smear.map_or(SmearParameters::default().strength, |(_, parameters, _)| {
+                    parameters.strength
+                }) * 100.0
+            ),
+        };
+        if text.0 != content {
+            text.0 = content;
+        }
+    }
+}
+
+fn update_paint_panel_button_colors(
+    panel: Res<PaintPanelState>,
+    document: Res<PaintStrokeDocument>,
+    mut buttons: Query<(&Interaction, &PaintPanelButton, &mut BackgroundColor)>,
+) {
+    let smear_enabled = smear_effect(&document).is_some_and(|(_, _, enabled)| enabled);
+    for (interaction, button, mut background) in &mut buttons {
+        let selected = match button.0 {
+            PaintPanelAction::SetMix(mix) => mix == panel.mix,
+            PaintPanelAction::SetTool(tool) => tool == panel.selected_tool,
+            PaintPanelAction::SelectLayer(layer) => layer == document.active_layer(),
+            PaintPanelAction::ToggleSmear => smear_enabled,
+            _ => false,
+        };
+        *background = BackgroundColor(panel_button_color(selected, *interaction));
+    }
+}
+
+fn panel_button_color(selected: bool, interaction: Interaction) -> Color {
+    match interaction {
+        Interaction::Pressed => Color::srgb_u8(66, 94, 145),
+        Interaction::Hovered if selected => Color::srgb_u8(58, 87, 137),
+        Interaction::Hovered => Color::srgb_u8(48, 59, 80),
+        Interaction::None if selected => Color::srgb_u8(49, 74, 118),
+        Interaction::None => Color::srgb_u8(31, 38, 51),
+    }
+}
+
+fn move_active_paint_layer(document: &mut PaintStrokeDocument, delta: isize) {
+    let active = document.active_layer();
+    let Some(index) = document.layer_index(active) else {
+        return;
+    };
+    let target = index
+        .saturating_add_signed(delta)
+        .min(document.layers().len().saturating_sub(1));
+    document.move_layer(active, target);
+}
+
+fn change_active_layer_opacity(document: &mut PaintStrokeDocument, delta: f32) {
+    let active = document.active_layer();
+    if let Some(opacity) = document.layer(active).map(|layer| layer.opacity) {
+        document.set_layer_opacity(active, opacity + delta);
+    }
+}
+
+fn change_brush_size(tool: Tool, settings: &mut StrokeRendererSettings, delta: f32) {
+    let profile = tool.profile_mut(settings);
+    profile.diameter = (profile.diameter + delta).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
+}
+
+fn change_brush_flow(tool: Tool, settings: &mut StrokeRendererSettings, delta: f32) {
+    let profile = tool.profile_mut(settings);
+    profile.flow = (profile.flow + delta).clamp(0.05, 1.0);
+}
+
+fn stroke_input_mode(tool: Tool) -> StrokeInputMode {
+    match tool {
+        Tool::Pen => StrokeInputMode::Paint,
+        Tool::Eraser => StrokeInputMode::Erase,
+        Tool::Smear => StrokeInputMode::Smear,
+    }
+}
+
+fn paint_mix_model(mix: PaintMix) -> hamerons_stroke_render::PaintModelId {
+    match mix {
+        PaintMix::Normal => RGBA_PAINT_MODEL_ID,
+        PaintMix::Pigment => PIGMENT_PAINT_MODEL_ID,
+    }
+}
+
+fn apply_selected_paint_material(
+    panel: &PaintPanelState,
+    selector: &ColorSelector,
+    settings: &mut StrokeRendererSettings,
+    rgba: &mut RgbaPaintModel,
+    pigment: &mut PigmentPaintModel,
+) {
+    let srgb = selector_srgb(selector);
+    let linear = srgb.map(srgb_to_linear);
+    match panel.mix {
+        PaintMix::Normal => {
+            let material = rgba.add_material(RgbaMaterial::from_linear_rgba([
+                linear[0], linear[1], linear[2], 1.0,
+            ]));
+            settings.pen.paint = PaintMaterialRef {
+                model: RGBA_PAINT_MODEL_ID,
+                model_version: RgbaPaintModel::MODEL_VERSION,
+                material,
+            };
+            settings.eraser.paint = PaintMaterialRef {
+                model: RGBA_PAINT_MODEL_ID,
+                model_version: RgbaPaintModel::MODEL_VERSION,
+                material: RgbaPaintModel::DEFAULT_ERASER,
+            };
+        }
+        PaintMix::Pigment => {
+            let scattering = 0.42;
+            let density = 0.86;
+            let absorption = linear.map(|reflectance| {
+                let reflectance = reflectance.clamp(0.015, 0.985);
+                let ratio = (1.0 - reflectance).powi(2) / (2.0 * reflectance);
+                (ratio * scattering / (0.2 + 2.8 * density)).clamp(0.0, 1.0)
+            });
+            let recipe = PigmentMaterial::new(
+                absorption,
+                scattering,
+                0.62,
+                0.22,
+                panel.pigment_wetness,
+                density,
+            )
+            .expect("paint-panel pigment controls stay normalized");
+            let material = pigment.add_material(recipe);
+            settings.pen.paint = PaintMaterialRef {
+                model: PIGMENT_PAINT_MODEL_ID,
+                model_version: PigmentPaintModel::MODEL_VERSION,
+                material,
+            };
+            settings.smear.paint = settings.pen.paint;
+            settings.eraser.paint = PaintMaterialRef {
+                model: PIGMENT_PAINT_MODEL_ID,
+                model_version: PigmentPaintModel::MODEL_VERSION,
+                material: PigmentPaintModel::DEFAULT_ERASER,
+            };
+        }
+    }
+}
+
+fn adopt_loaded_paint_model(
+    paint: PaintMaterialRef,
+    panel: &mut PaintPanelState,
+    settings: &mut StrokeRendererSettings,
+) {
+    if paint.model == PIGMENT_PAINT_MODEL_ID {
+        panel.mix = PaintMix::Pigment;
+        settings.pen.paint = paint;
+        settings.smear.paint = paint;
+        settings.eraser.paint = PaintMaterialRef {
+            model: PIGMENT_PAINT_MODEL_ID,
+            model_version: PigmentPaintModel::MODEL_VERSION,
+            material: PigmentPaintModel::DEFAULT_ERASER,
+        };
+    } else if paint.model == RGBA_PAINT_MODEL_ID {
+        panel.mix = PaintMix::Normal;
+        if panel.selected_tool == Tool::Smear {
+            panel.selected_tool = Tool::Pen;
+        }
+        settings.pen.paint = paint;
+        settings.eraser.paint = PaintMaterialRef {
+            model: RGBA_PAINT_MODEL_ID,
+            model_version: RgbaPaintModel::MODEL_VERSION,
+            material: RgbaPaintModel::DEFAULT_ERASER,
+        };
+    }
+}
+
+fn smear_effect(document: &PaintStrokeDocument) -> Option<(EffectNodeId, SmearParameters, bool)> {
+    document.effects().nodes().iter().find_map(|node| {
+        (node.effect == SMEAR_EFFECT_ID && node.implementation_version == SMEAR_EFFECT_VERSION)
+            .then(|| {
+                SmearParameters::from_bytes(&node.parameters)
+                    .ok()
+                    .map(|parameters| (node.id, parameters, node.enabled))
+            })
+            .flatten()
+    })
+}
+
+fn ensure_smear_effect(document: &mut PaintStrokeDocument) {
+    if smear_effect(document).is_some() {
+        return;
+    }
+    let mut graph = document.effects().clone();
+    let source = graph.nodes().first().map(|node| node.id);
+    let Ok(smear) = graph.add_smear(SmearParameters::default()) else {
+        return;
+    };
+    if let Some(source) = source {
+        let _ = graph.add_dependency(smear, source);
+    }
+    document.set_effects(graph);
+}
+
+fn toggle_smear_effect(document: &mut PaintStrokeDocument) {
+    ensure_smear_effect(document);
+    let Some((id, _, enabled)) = smear_effect(document) else {
+        return;
+    };
+    let mut graph = document.effects().clone();
+    graph.set_enabled(id, !enabled);
+    document.set_effects(graph);
+}
+
+fn change_smear_strength(document: &mut PaintStrokeDocument, delta: f32) {
+    ensure_smear_effect(document);
+    let Some((id, mut parameters, _)) = smear_effect(document) else {
+        return;
+    };
+    parameters.strength = (parameters.strength + delta).clamp(0.0, 1.0);
+    let mut graph = document.effects().clone();
+    if graph.set_smear_parameters(id, parameters).is_ok() {
+        document.set_effects(graph);
+    }
+}
+
 fn update_input_blockers(
     window: Single<&Window, With<PrimaryWindow>>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -722,7 +1603,11 @@ fn update_input_blockers(
     if *state.get() != LabState::Hamerons || shift {
         paint_blocker.set_regions([full_window]);
     } else {
-        paint_blocker.set_regions([picker_rect(&window)]);
+        paint_blocker.set_regions([
+            picker_rect(&window),
+            layer_panel_rect(&window),
+            brush_panel_rect(),
+        ]);
     }
     if *state.get() != LabState::Vector || shift {
         vector_blocker.set_regions([full_window]);
@@ -745,8 +1630,10 @@ fn handle_color_selector(
     mut selector: ResMut<ColorSelector>,
     mut images: ResMut<Assets<Image>>,
     mut rgba: ResMut<RgbaPaintModel>,
+    mut pigment: ResMut<PigmentPaintModel>,
     mut settings: ResMut<StrokeRendererSettings>,
     mut vector_settings: ResMut<VectorStrokeSettings>,
+    paint_panel: Res<PaintPanelState>,
     state: Res<State<LabState>>,
 ) {
     let cursor = window.cursor_position();
@@ -843,11 +1730,13 @@ fn handle_color_selector(
         let srgb = selector_srgb(&selector);
         match state.get() {
             LabState::Hamerons => {
-                let linear = srgb.map(srgb_to_linear);
-                let material = rgba.add_material(RgbaMaterial::from_linear_rgba([
-                    linear[0], linear[1], linear[2], 1.0,
-                ]));
-                settings.pen.paint.material = material;
+                apply_selected_paint_material(
+                    &paint_panel,
+                    &selector,
+                    &mut settings,
+                    &mut rgba,
+                    &mut pigment,
+                );
             }
             LabState::Vector => {
                 vector_settings.pen_style.color = Srgba8::new(
@@ -871,6 +1760,32 @@ fn picker_rect(window: &Window) -> Rect {
         min,
         min + Vec2::new(PICKER_WIDTH as f32, PICKER_HEIGHT as f32),
     )
+}
+
+fn layer_panel_rect(window: &Window) -> Rect {
+    Rect::from_corners(
+        Vec2::new(window.width() - PANEL_MARGIN - PANEL_WIDTH, LAYER_PANEL_TOP),
+        Vec2::new(
+            window.width() - PANEL_MARGIN,
+            (window.height() - PANEL_MARGIN).max(LAYER_PANEL_TOP),
+        ),
+    )
+}
+
+fn brush_panel_rect() -> Rect {
+    Rect::from_corners(
+        Vec2::new(PANEL_MARGIN, BRUSH_PANEL_TOP),
+        Vec2::new(
+            PANEL_MARGIN + PANEL_WIDTH,
+            BRUSH_PANEL_TOP + BRUSH_PANEL_HEIGHT,
+        ),
+    )
+}
+
+fn paint_ui_contains(window: &Window, position: Vec2) -> bool {
+    picker_rect(window).contains(position)
+        || layer_panel_rect(window).contains(position)
+        || brush_panel_rect().contains(position)
 }
 
 fn picker_local(window: &Window, viewport_position: Vec2) -> Vec2 {
@@ -1048,6 +1963,7 @@ fn collect_mouse_strokes(
     mut sizing: ResMut<BrushSizing>,
     mut pointer: ResMut<PointerState>,
     selector: Res<ColorSelector>,
+    panel: Res<PaintPanelState>,
 ) {
     let mut positions: Vec<_> = cursor_events.read().map(|event| event.position).collect();
     if positions.is_empty()
@@ -1063,7 +1979,7 @@ fn collect_mouse_strokes(
     let tool = if mouse_buttons.pressed(MouseButton::Right) {
         Tool::Eraser
     } else if down {
-        Tool::Pen
+        panel.selected_tool
     } else {
         pointer.tool
     };
@@ -1071,7 +1987,7 @@ fn collect_mouse_strokes(
         || mouse_buttons.just_pressed(MouseButton::Right);
     let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
 
-    if selector.hovered || selector.drag.is_some() {
+    if selector.hovered || selector.drag.is_some() || panel.hovered {
         end_mouse_stroke(&mut document, &mut mouse);
         sizing.end(PointerSource::Mouse);
         return;
@@ -1186,6 +2102,7 @@ fn observe_pen_pointer(
     mut pen_events: MessageReader<PenInput>,
     keys: Res<ButtonInput<KeyCode>>,
     window: Single<&Window, With<PrimaryWindow>>,
+    panel: Res<PaintPanelState>,
     mut pointer: ResMut<PointerState>,
     mut sizing: ResMut<BrushSizing>,
     mut settings: ResMut<StrokeRendererSettings>,
@@ -1202,7 +2119,7 @@ fn observe_pen_pointer(
         let tool = if event.pen.tool == PenToolKind::Eraser {
             Tool::Eraser
         } else {
-            Tool::Pen
+            panel.selected_tool
         };
 
         match &event.action {
@@ -1214,7 +2131,7 @@ fn observe_pen_pointer(
             PenAction::Moved(data) => {
                 if let Some(position) = event.pen.position {
                     pointer.show_pen(position, tool, Some(data));
-                    if pointer.pen_contact && shift && !picker_rect(&window).contains(position) {
+                    if pointer.pen_contact && shift && !paint_ui_contains(&window, position) {
                         update_size_gesture(
                             PointerSource::Tablet,
                             tool,
@@ -1233,7 +2150,7 @@ fn observe_pen_pointer(
                 pointer.pen_contact = state.is_pressed();
                 if let Some(position) = event.pen.position {
                     pointer.show_pen(position, tool, Some(data));
-                    if state.is_pressed() && shift && !picker_rect(&window).contains(position) {
+                    if state.is_pressed() && shift && !paint_ui_contains(&window, position) {
                         update_size_gesture(
                             PointerSource::Tablet,
                             tool,
@@ -1262,7 +2179,7 @@ fn observe_pen_pointer(
 
 fn vector_tool_size(tool: Tool, settings: &VectorStrokeSettings) -> f32 {
     match tool {
-        Tool::Pen => settings.pen_style.base_width,
+        Tool::Pen | Tool::Smear => settings.pen_style.base_width,
         Tool::Eraser => settings.eraser_radius * 2.0,
     }
 }
@@ -1270,7 +2187,7 @@ fn vector_tool_size(tool: Tool, settings: &VectorStrokeSettings) -> f32 {
 fn set_vector_tool_size(tool: Tool, settings: &mut VectorStrokeSettings, diameter: f32) {
     let diameter = diameter.clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
     match tool {
-        Tool::Pen => settings.pen_style.base_width = diameter,
+        Tool::Pen | Tool::Smear => settings.pen_style.base_width = diameter,
         Tool::Eraser => settings.eraser_radius = diameter * 0.5,
     }
 }
@@ -1606,7 +2523,7 @@ fn draw_vector_brush_preview(
         1.0
     };
     let diameter = match pointer.tool {
-        Tool::Pen => settings.pen_style.width_at(pressure),
+        Tool::Pen | Tool::Smear => settings.pen_style.width_at(pressure),
         Tool::Eraser => settings.eraser_radius * 2.0,
     };
     let world_position = Vec2::new(
@@ -1614,7 +2531,7 @@ fn draw_vector_brush_preview(
         window.height() * 0.5 - position.y,
     );
     let color = match pointer.tool {
-        Tool::Pen => {
+        Tool::Pen | Tool::Smear => {
             let [red, green, blue, _] = settings.pen_style.color.as_f32();
             Color::srgb(red, green, blue)
         }
@@ -1707,6 +2624,8 @@ fn keyboard_shortcuts(
     mut document_status: ResMut<DocumentStatus>,
     mut mouse: ResMut<MouseStroke>,
     pointer: Res<PointerState>,
+    mut paint_panel: ResMut<PaintPanelState>,
+    mut input_mode: ResMut<StrokeInputMode>,
 ) {
     let ctrl = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
     let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
@@ -1743,7 +2662,16 @@ fn keyboard_shortcuts(
             match PaintStrokeDocument::load_kra(PAINT_DOCUMENT_PATH, &paint_models, &effects) {
                 Ok(loaded) => {
                     let issues = loaded.compatibility_issues.len();
+                    let loaded_paint = loaded
+                        .document
+                        .strokes()
+                        .last()
+                        .map(|stroke| stroke.brush.paint);
                     document.replace_loaded(loaded.document);
+                    if let Some(paint) = loaded_paint {
+                        adopt_loaded_paint_model(paint, &mut paint_panel, &mut settings);
+                        *input_mode = stroke_input_mode(paint_panel.selected_tool);
+                    }
                     mouse.stroke = None;
                     mouse.resampler = None;
                     document_status.0 = if issues == 0 {
@@ -1842,16 +2770,21 @@ fn draw_brush_preview(
     sizing: Res<BrushSizing>,
     settings: Res<StrokeRendererSettings>,
     selector: Res<ColorSelector>,
+    panel: Res<PaintPanelState>,
 ) {
-    if (pointer.down && !sizing.active_for(pointer.source))
+    if (pointer.down && pointer.tool != Tool::Smear && !sizing.active_for(pointer.source))
         || selector.hovered
         || selector.drag.is_some()
+        || panel.hovered
     {
         return;
     }
     let Some(position) = pointer.position else {
         return;
     };
+    if paint_ui_contains(&window, position) {
+        return;
+    }
     let pressure = if pointer.down {
         pointer.pressure.unwrap_or(1.0)
     } else {
@@ -1870,6 +2803,7 @@ fn draw_brush_preview(
     let color = match pointer.tool {
         Tool::Pen => Color::srgb(selected[0], selected[1], selected[2]),
         Tool::Eraser => Color::srgb(0.94, 0.25, 0.34),
+        Tool::Smear => Color::srgb(0.24, 0.78, 0.92),
     };
 
     let direction = Vec2::new(pointer.tilt.x, -pointer.tilt.y).normalize_or(Vec2::X);
@@ -1889,6 +2823,7 @@ fn draw_brush_preview(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_hud(
     pointer: Res<PointerState>,
     settings: Res<StrokeRendererSettings>,
@@ -1896,6 +2831,7 @@ fn update_hud(
     tiles: Res<CanvasTileCache>,
     window: Single<&Window, With<PrimaryWindow>>,
     document_status: Res<DocumentStatus>,
+    panel: Res<PaintPanelState>,
     mut text: Single<&mut Text, With<HudText>>,
 ) {
     let pressure = pointer.pressure.map_or_else(
@@ -1914,12 +2850,13 @@ fn update_hud(
         _ => "vsync",
     };
     let content = format!(
-        "HAMERONS STROKE  /  {}  •  {:.0} px  •  pressure {}  •  tilt {:.0}°  •  {}\n\
-         LMB/RMB draw/erase   Shift+drag size   [ ] size   C clear   Ctrl+Z undo   V {}   Ctrl+S/O save/load   Esc menu\n\
+        "HAMERONS STROKE  /  {}  •  {:.0} px  •  {} mix  •  pressure {}  •  tilt {:.0}°  •  {}\n\
+         LMB selected tool / RMB erase   SMEAR drags wet pigment   Shift+drag size   [ ] size   C clear   Ctrl+Z undo   V {}   Ctrl+S/O save/load   Esc menu\n\
          LAYER {}/{}  •  {}  •  {:.0}%  •  {}   N new   PgUp/Dn select   Shift+Pg move   H hide   , . opacity\n\
          ENGINE  •  {} strokes  •  {} points  •  {} segments  •  {} resident tiles  •  {}",
         pointer.tool.label(),
         profile.diameter,
+        panel.mix.label(),
         pressure,
         tilt,
         pointer.source.label(),
@@ -2040,5 +2977,71 @@ mod tests {
         assert_eq!(style.width_at(1.0), 18.0);
         assert!(style.width_at(0.2) < 2.2);
         assert_eq!(style.width_at(0.0), 18.0 * VECTOR_MIN_WIDTH_FACTOR);
+    }
+
+    #[test]
+    fn paint_mix_selects_matching_pen_and_eraser_models() {
+        let selector = ColorSelector::default();
+        let mut settings = StrokeRendererSettings::default();
+        let mut rgba = RgbaPaintModel::default();
+        let mut pigment = PigmentPaintModel::default();
+        let mut panel = PaintPanelState::default();
+
+        apply_selected_paint_material(&panel, &selector, &mut settings, &mut rgba, &mut pigment);
+        assert_eq!(settings.pen.paint.model, RGBA_PAINT_MODEL_ID);
+        assert_eq!(settings.eraser.paint.model, RGBA_PAINT_MODEL_ID);
+
+        panel.mix = PaintMix::Pigment;
+        panel.pigment_wetness = 0.73;
+        apply_selected_paint_material(&panel, &selector, &mut settings, &mut rgba, &mut pigment);
+        assert_eq!(settings.pen.paint.model, PIGMENT_PAINT_MODEL_ID);
+        assert_eq!(settings.eraser.paint.model, PIGMENT_PAINT_MODEL_ID);
+        assert_eq!(settings.smear.paint, settings.pen.paint);
+        assert_eq!(
+            Tool::Smear.profile(&settings).deposition,
+            hamerons_stroke_render::DepositionMode::Smear
+        );
+        assert_eq!(
+            pigment.materials()[settings.pen.paint.material.0 as usize].wetness,
+            0.73
+        );
+    }
+
+    #[test]
+    fn smear_tool_selects_the_no_paint_primary_pen_mode() {
+        assert_eq!(stroke_input_mode(Tool::Pen), StrokeInputMode::Paint);
+        assert_eq!(stroke_input_mode(Tool::Eraser), StrokeInputMode::Erase);
+        assert_eq!(stroke_input_mode(Tool::Smear), StrokeInputMode::Smear);
+    }
+
+    #[test]
+    fn pigment_smear_controls_create_toggle_and_adjust_the_native_effect() {
+        let mut document = PaintStrokeDocument::default();
+        assert!(smear_effect(&document).is_none());
+
+        ensure_smear_effect(&mut document);
+        let (_, default_parameters, enabled) = smear_effect(&document).unwrap();
+        assert!(enabled);
+        assert_eq!(default_parameters, SmearParameters::default());
+
+        change_smear_strength(&mut document, 0.1);
+        let (_, stronger, enabled) = smear_effect(&document).unwrap();
+        assert!(enabled);
+        assert!((stronger.strength - 0.75).abs() < f32::EPSILON);
+
+        toggle_smear_effect(&mut document);
+        assert!(!smear_effect(&document).unwrap().2);
+    }
+
+    #[test]
+    fn paint_panel_regions_do_not_cover_the_center_canvas() {
+        let mut window = Window::default();
+        window
+            .resolution
+            .set(START_WIDTH as f32, START_HEIGHT as f32);
+
+        assert!(layer_panel_rect(&window).contains(Vec2::new(1_000.0, 500.0)));
+        assert!(brush_panel_rect().contains(Vec2::new(100.0, 250.0)));
+        assert!(!paint_ui_contains(&window, Vec2::new(600.0, 500.0)));
     }
 }

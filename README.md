@@ -42,6 +42,20 @@ The advanced color selector at the upper right uses a hue ring and a
 saturation/value triangle. Drag either with the mouse or tablet pen; releasing
 commits an immutable material for subsequent strokes.
 
+Paint mode also provides two pointer-friendly panels:
+
+- **Layers** selects, creates, reorders, hides, and changes the opacity of paint
+  layers. Its **Paint Mix** control switches the active document surface
+  between normal RGBA paint and the native two-plane pigment model. A document
+  keeps one paint model because the models use different persistent GPU plane
+  layouts, so the selector will not reinterpret strokes already recorded with
+  the other model.
+- **Brush** selects paint, eraser, or a dedicated local smear tool; changes
+  size and flow; and controls pigment wetness. Dragging with **Smear** moves
+  existing wet pigment under the brush without adding color. The separately
+  labeled **Global Smear** controls apply the non-destructive effect across the
+  whole pigment surface.
+
 The Hamerons preview uses its pressure/tilt brush footprint. The vector preview
 shows the pressure-adjusted path width; pressure and tilt samples are retained
 in the RON document for later editing or export.
