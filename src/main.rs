@@ -12,16 +12,16 @@ use bevy::{
     render::{
         pipelined_rendering::PipelinedRenderingPlugin,
         render_resource::{Extent3d, TextureDimension, TextureFormat},
+        view::screenshot::{Screenshot, ScreenshotCaptured},
     },
     window::{CursorLeft, CursorMoved, CursorOptions, PresentMode, PrimaryWindow, WindowPlugin},
     winit::WinitSettings,
 };
 use hamerons_stroke_render::{
     BrushProfile, BrushSizeSpace, CanvasTileCache, CheckpointRequest, DocumentCheckpointManager,
-    EffectNodeId, EffectRegistry, HameronsStrokeRenderPlugin, LayerId as PaintLayerId,
-    PIGMENT_PAINT_MODEL_ID, PaintMaterialRef, PaintModelRegistry, PigmentMaterial,
-    PigmentPaintModel, RGBA_PAINT_MODEL_ID, RgbaMaterial, RgbaPaintModel, SMEAR_EFFECT_ID,
-    SMEAR_EFFECT_VERSION, SmearParameters, StrokeDocument as PaintStrokeDocument, StrokeId,
+    EffectRegistry, HameronsStrokeRenderPlugin, LayerId as PaintLayerId, PIGMENT_PAINT_MODEL_ID,
+    PaintMaterialRef, PaintModelRegistry, PigmentMaterial, PigmentPaintModel, RGBA_PAINT_MODEL_ID,
+    RgbaMaterial, RgbaPaintModel, StrokeDocument as PaintStrokeDocument, StrokeId,
     StrokeInputBlocker, StrokeInputMode, StrokeInputSystems as PaintStrokeInputSystems,
     StrokePoint, StrokePointResampler, StrokeRendererSettings,
 };
@@ -91,6 +91,7 @@ fn main() {
         .init_resource::<BrushSizing>()
         .init_resource::<DocumentStatus>()
         .init_resource::<ColorSelector>()
+        .init_resource::<ColorSampler>()
         .init_resource::<VectorSession>()
         .init_resource::<PaintSession>()
         .init_resource::<PaintPanelState>()
@@ -126,6 +127,7 @@ fn main() {
                 update_paint_panel_readouts,
                 update_paint_panel_button_colors,
                 observe_pen_pointer,
+                request_color_sample,
                 collect_mouse_strokes,
                 keyboard_shortcuts,
                 poll_document_checkpoint,
@@ -246,11 +248,10 @@ enum PaintPanelAction {
     IncreaseBrushSize,
     DecreaseBrushFlow,
     IncreaseBrushFlow,
+    DecreaseBrushSoftness,
+    IncreaseBrushSoftness,
     DecreasePigmentWetness,
     IncreasePigmentWetness,
-    ToggleSmear,
-    DecreaseSmearStrength,
-    IncreaseSmearStrength,
 }
 
 #[derive(Component)]
@@ -260,9 +261,8 @@ struct PaintPanelButton(PaintPanelAction);
 enum PaintPanelReadout {
     BrushSize,
     BrushFlow,
+    BrushSoftness,
     PigmentWetness,
-    Smear,
-    SmearStrength,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -450,6 +450,26 @@ struct ColorSelector {
     image: Handle<Image>,
     drag: Option<SelectorDrag>,
     hovered: bool,
+}
+
+#[derive(Resource, Default)]
+struct ColorSampler {
+    mouse_active: bool,
+    pen_active: bool,
+    next_serial: u64,
+    latest_serial: u64,
+}
+
+impl ColorSampler {
+    fn active(&self) -> bool {
+        self.mouse_active || self.pen_active
+    }
+}
+
+#[derive(Component)]
+struct ColorSampleRequest {
+    normalized_position: Vec2,
+    serial: u64,
 }
 
 impl Default for ColorSelector {
@@ -656,6 +676,7 @@ fn leave_hamerons_mode(
     mut pointer: ResMut<PointerState>,
     mut selector: ResMut<ColorSelector>,
     mut panel: ResMut<PaintPanelState>,
+    mut sampler: ResMut<ColorSampler>,
 ) {
     end_mouse_stroke(&mut document, &mut mouse);
     let mut stored = PaintStrokeDocument::default();
@@ -666,6 +687,7 @@ fn leave_hamerons_mode(
     selector.drag = None;
     selector.hovered = false;
     panel.hovered = false;
+    *sampler = default();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1005,41 +1027,20 @@ fn spawn_paint_panels(commands: &mut Commands) {
             );
             spawn_paint_control_row(
                 panel,
+                "SOFTNESS",
+                PaintPanelReadout::BrushSoftness,
+                PaintPanelAction::DecreaseBrushSoftness,
+                PaintPanelAction::IncreaseBrushSoftness,
+            );
+            spawn_paint_control_row(
+                panel,
                 "PIGMENT WETNESS",
                 PaintPanelReadout::PigmentWetness,
                 PaintPanelAction::DecreasePigmentWetness,
                 PaintPanelAction::IncreasePigmentWetness,
             );
-            panel
-                .spawn(Node {
-                    width: percent(100),
-                    display: Display::Flex,
-                    align_items: AlignItems::Center,
-                    column_gap: px(7),
-                    ..default()
-                })
-                .with_children(|row| {
-                    row.spawn((
-                        PaintPanelReadout::Smear,
-                        Text::new("GLOBAL SMEAR"),
-                        TextFont::from_font_size(12.0),
-                        TextColor(Color::srgb_u8(185, 194, 210)),
-                        Node {
-                            flex_grow: 1.0,
-                            ..default()
-                        },
-                    ));
-                    spawn_paint_panel_button(row, PaintPanelAction::ToggleSmear, "TOGGLE", px(88));
-                });
-            spawn_paint_control_row(
-                panel,
-                "GLOBAL STRENGTH",
-                PaintPanelReadout::SmearStrength,
-                PaintPanelAction::DecreaseSmearStrength,
-                PaintPanelAction::IncreaseSmearStrength,
-            );
             panel.spawn((
-                Text::new("SMEAR drags wet pigment only; GLOBAL SMEAR affects the whole surface."),
+                Text::new("Choose SMEAR, then drag through wet pigment. It never adds paint."),
                 TextFont::from_font_size(10.0),
                 TextColor(Color::srgb_u8(117, 129, 151)),
                 Node {
@@ -1147,7 +1148,6 @@ fn paint_panel_interaction(
     selector: Res<ColorSelector>,
     mut rgba: ResMut<RgbaPaintModel>,
     mut pigment: ResMut<PigmentPaintModel>,
-    mut status: ResMut<DocumentStatus>,
 ) {
     let mut actions = Vec::new();
     actions.extend(changed_buttons.iter().filter_map(|(interaction, button)| {
@@ -1211,42 +1211,22 @@ fn paint_panel_interaction(
                 change_active_layer_opacity(&mut document, 0.1);
             }
             PaintPanelAction::SetMix(mix) => {
-                let model = paint_mix_model(mix);
-                if document
-                    .strokes()
-                    .iter()
-                    .any(|stroke| stroke.brush.paint.model != model)
-                {
-                    status.0 =
-                        "paint mix unchanged: one paint model is supported per document".into();
-                } else {
-                    panel.mix = mix;
-                    apply_selected_paint_material(
-                        &panel,
-                        &selector,
-                        &mut settings,
-                        &mut rgba,
-                        &mut pigment,
-                    );
-                    if mix == PaintMix::Normal && panel.selected_tool == Tool::Smear {
-                        panel.selected_tool = Tool::Pen;
-                        pointer.tool = Tool::Pen;
-                        *input_mode = StrokeInputMode::Paint;
-                    }
+                panel.mix = mix;
+                apply_selected_paint_material(
+                    &panel,
+                    &selector,
+                    &mut settings,
+                    &mut rgba,
+                    &mut pigment,
+                );
+                if mix == PaintMix::Normal && panel.selected_tool == Tool::Smear {
+                    panel.selected_tool = Tool::Pen;
+                    pointer.tool = Tool::Pen;
+                    *input_mode = StrokeInputMode::Paint;
                 }
             }
             PaintPanelAction::SetTool(tool) => {
                 if tool == Tool::Smear && panel.mix != PaintMix::Pigment {
-                    if document
-                        .strokes()
-                        .iter()
-                        .any(|stroke| stroke.brush.paint.model != PIGMENT_PAINT_MODEL_ID)
-                    {
-                        status.0 =
-                            "smear needs a pigment document; the current normal strokes are unchanged"
-                                .into();
-                        continue;
-                    }
                     panel.mix = PaintMix::Pigment;
                     apply_selected_paint_material(
                         &panel,
@@ -1272,6 +1252,12 @@ fn paint_panel_interaction(
             PaintPanelAction::IncreaseBrushFlow => {
                 change_brush_flow(panel.selected_tool, &mut settings, 0.05);
             }
+            PaintPanelAction::DecreaseBrushSoftness => {
+                change_brush_softness(panel.selected_tool, &mut settings, -0.05);
+            }
+            PaintPanelAction::IncreaseBrushSoftness => {
+                change_brush_softness(panel.selected_tool, &mut settings, 0.05);
+            }
             PaintPanelAction::DecreasePigmentWetness => {
                 panel.pigment_wetness = (panel.pigment_wetness - 0.05).clamp(0.0, 1.0);
                 if panel.mix == PaintMix::Pigment {
@@ -1295,15 +1281,6 @@ fn paint_panel_interaction(
                         &mut pigment,
                     );
                 }
-            }
-            PaintPanelAction::ToggleSmear => {
-                toggle_smear_effect(&mut document);
-            }
-            PaintPanelAction::DecreaseSmearStrength => {
-                change_smear_strength(&mut document, -0.05);
-            }
-            PaintPanelAction::IncreaseSmearStrength => {
-                change_smear_strength(&mut document, 0.05);
             }
         }
     }
@@ -1352,32 +1329,19 @@ fn refresh_paint_layer_rows(
 fn update_paint_panel_readouts(
     panel: Res<PaintPanelState>,
     settings: Res<StrokeRendererSettings>,
-    document: Res<PaintStrokeDocument>,
     mut readouts: Query<(&PaintPanelReadout, &mut Text)>,
 ) {
     let profile = panel.selected_tool.profile(&settings);
-    let smear = smear_effect(&document);
     for (readout, mut text) in &mut readouts {
         let content = match readout {
             PaintPanelReadout::BrushSize => format!("SIZE  {:.0} px", profile.diameter),
             PaintPanelReadout::BrushFlow => format!("FLOW  {:.0}%", profile.flow * 100.0),
+            PaintPanelReadout::BrushSoftness => {
+                format!("SOFTNESS  {:.0}%", profile.softness * 100.0)
+            }
             PaintPanelReadout::PigmentWetness => {
                 format!("PIGMENT WETNESS  {:.0}%", panel.pigment_wetness * 100.0)
             }
-            PaintPanelReadout::Smear => format!(
-                "GLOBAL SMEAR  {}",
-                if smear.is_some_and(|(_, _, enabled)| enabled) {
-                    "ON"
-                } else {
-                    "OFF"
-                }
-            ),
-            PaintPanelReadout::SmearStrength => format!(
-                "GLOBAL STRENGTH  {:.0}%",
-                smear.map_or(SmearParameters::default().strength, |(_, parameters, _)| {
-                    parameters.strength
-                }) * 100.0
-            ),
         };
         if text.0 != content {
             text.0 = content;
@@ -1390,13 +1354,11 @@ fn update_paint_panel_button_colors(
     document: Res<PaintStrokeDocument>,
     mut buttons: Query<(&Interaction, &PaintPanelButton, &mut BackgroundColor)>,
 ) {
-    let smear_enabled = smear_effect(&document).is_some_and(|(_, _, enabled)| enabled);
     for (interaction, button, mut background) in &mut buttons {
         let selected = match button.0 {
             PaintPanelAction::SetMix(mix) => mix == panel.mix,
             PaintPanelAction::SetTool(tool) => tool == panel.selected_tool,
             PaintPanelAction::SelectLayer(layer) => layer == document.active_layer(),
-            PaintPanelAction::ToggleSmear => smear_enabled,
             _ => false,
         };
         *background = BackgroundColor(panel_button_color(selected, *interaction));
@@ -1441,18 +1403,16 @@ fn change_brush_flow(tool: Tool, settings: &mut StrokeRendererSettings, delta: f
     profile.flow = (profile.flow + delta).clamp(0.05, 1.0);
 }
 
+fn change_brush_softness(tool: Tool, settings: &mut StrokeRendererSettings, delta: f32) {
+    let profile = tool.profile_mut(settings);
+    profile.softness = (profile.softness + delta).clamp(0.0, 1.0);
+}
+
 fn stroke_input_mode(tool: Tool) -> StrokeInputMode {
     match tool {
         Tool::Pen => StrokeInputMode::Paint,
         Tool::Eraser => StrokeInputMode::Erase,
         Tool::Smear => StrokeInputMode::Smear,
-    }
-}
-
-fn paint_mix_model(mix: PaintMix) -> hamerons_stroke_render::PaintModelId {
-    match mix {
-        PaintMix::Normal => RGBA_PAINT_MODEL_ID,
-        PaintMix::Pigment => PIGMENT_PAINT_MODEL_ID,
     }
 }
 
@@ -1483,11 +1443,12 @@ fn apply_selected_paint_material(
         }
         PaintMix::Pigment => {
             let scattering = 0.42;
+            let resolved_scattering = 0.06 + scattering * 1.94;
             let density = 0.86;
             let absorption = linear.map(|reflectance| {
                 let reflectance = reflectance.clamp(0.015, 0.985);
                 let ratio = (1.0 - reflectance).powi(2) / (2.0 * reflectance);
-                (ratio * scattering / (0.2 + 2.8 * density)).clamp(0.0, 1.0)
+                (ratio * resolved_scattering / (0.2 + 9.8 * density)).clamp(0.0, 1.0)
             });
             let recipe = PigmentMaterial::new(
                 absorption,
@@ -1542,55 +1503,6 @@ fn adopt_loaded_paint_model(
     }
 }
 
-fn smear_effect(document: &PaintStrokeDocument) -> Option<(EffectNodeId, SmearParameters, bool)> {
-    document.effects().nodes().iter().find_map(|node| {
-        (node.effect == SMEAR_EFFECT_ID && node.implementation_version == SMEAR_EFFECT_VERSION)
-            .then(|| {
-                SmearParameters::from_bytes(&node.parameters)
-                    .ok()
-                    .map(|parameters| (node.id, parameters, node.enabled))
-            })
-            .flatten()
-    })
-}
-
-fn ensure_smear_effect(document: &mut PaintStrokeDocument) {
-    if smear_effect(document).is_some() {
-        return;
-    }
-    let mut graph = document.effects().clone();
-    let source = graph.nodes().first().map(|node| node.id);
-    let Ok(smear) = graph.add_smear(SmearParameters::default()) else {
-        return;
-    };
-    if let Some(source) = source {
-        let _ = graph.add_dependency(smear, source);
-    }
-    document.set_effects(graph);
-}
-
-fn toggle_smear_effect(document: &mut PaintStrokeDocument) {
-    ensure_smear_effect(document);
-    let Some((id, _, enabled)) = smear_effect(document) else {
-        return;
-    };
-    let mut graph = document.effects().clone();
-    graph.set_enabled(id, !enabled);
-    document.set_effects(graph);
-}
-
-fn change_smear_strength(document: &mut PaintStrokeDocument, delta: f32) {
-    ensure_smear_effect(document);
-    let Some((id, mut parameters, _)) = smear_effect(document) else {
-        return;
-    };
-    parameters.strength = (parameters.strength + delta).clamp(0.0, 1.0);
-    let mut graph = document.effects().clone();
-    if graph.set_smear_parameters(id, parameters).is_ok() {
-        document.set_effects(graph);
-    }
-}
-
 fn update_input_blockers(
     window: Single<&Window, With<PrimaryWindow>>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -1599,8 +1511,9 @@ fn update_input_blockers(
     mut vector_blocker: ResMut<VectorStrokeInputBlocker>,
 ) {
     let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+    let ctrl = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
     let full_window = Rect::from_corners(Vec2::ZERO, Vec2::new(window.width(), window.height()));
-    if *state.get() != LabState::Hamerons || shift {
+    if *state.get() != LabState::Hamerons || shift || ctrl {
         paint_blocker.set_regions([full_window]);
     } else {
         paint_blocker.set_regions([
@@ -1949,6 +1862,152 @@ fn color_byte(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
+fn set_selector_srgb(selector: &mut ColorSelector, srgb: [f32; 3]) {
+    let [red, green, blue] = srgb.map(|channel| channel.clamp(0.0, 1.0));
+    let maximum = red.max(green).max(blue);
+    let minimum = red.min(green).min(blue);
+    let chroma = maximum - minimum;
+    if chroma > f32::EPSILON {
+        let sector = if maximum == red {
+            (green - blue) / chroma
+        } else if maximum == green {
+            (blue - red) / chroma + 2.0
+        } else {
+            (red - green) / chroma + 4.0
+        };
+        selector.hue = (sector / 6.0).rem_euclid(1.0);
+    }
+    selector.saturation = if maximum > 0.0 { chroma / maximum } else { 0.0 };
+    selector.value = maximum;
+}
+
+fn sample_pixel_coordinates(normalized_position: Vec2, width: u32, height: u32) -> UVec2 {
+    let width = width.max(1);
+    let height = height.max(1);
+    UVec2::new(
+        (normalized_position.x.clamp(0.0, 1.0) * width as f32)
+            .floor()
+            .min((width - 1) as f32) as u32,
+        (normalized_position.y.clamp(0.0, 1.0) * height as f32)
+            .floor()
+            .min((height - 1) as f32) as u32,
+    )
+}
+
+fn request_color_sample(
+    mut commands: Commands,
+    keys: Res<ButtonInput<KeyCode>>,
+    mouse_buttons: Res<ButtonInput<MouseButton>>,
+    mut pen_events: MessageReader<PenInput>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    mut sampler: ResMut<ColorSampler>,
+) {
+    if !mouse_buttons.pressed(MouseButton::Left) {
+        sampler.mouse_active = false;
+    }
+    let ctrl = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
+    let mut requested_position = None;
+    if ctrl
+        && mouse_buttons.just_pressed(MouseButton::Left)
+        && let Some(position) = window.cursor_position()
+        && !paint_ui_contains(&window, position)
+    {
+        sampler.mouse_active = true;
+        requested_position = Some(position);
+    }
+    for event in pen_events.read().filter(|event| event.pen.primary) {
+        match &event.action {
+            PenAction::Button {
+                button: PenButton::Contact,
+                state,
+                ..
+            } if state.is_pressed() && ctrl => {
+                if let Some(position) = event
+                    .pen
+                    .position
+                    .filter(|position| !paint_ui_contains(&window, *position))
+                {
+                    sampler.pen_active = true;
+                    requested_position = Some(position);
+                }
+            }
+            PenAction::Button {
+                button: PenButton::Contact,
+                state,
+                ..
+            } if !state.is_pressed() => {
+                sampler.pen_active = false;
+            }
+            PenAction::Left => {
+                sampler.pen_active = false;
+            }
+            _ => {}
+        }
+    }
+
+    let Some(position) = requested_position else {
+        return;
+    };
+    let serial = sampler.next_serial;
+    sampler.next_serial = sampler.next_serial.wrapping_add(1);
+    sampler.latest_serial = serial;
+    let normalized_position = Vec2::new(
+        position.x / window.width().max(1.0),
+        position.y / window.height().max(1.0),
+    );
+    commands
+        .spawn((
+            Screenshot::primary_window(),
+            DespawnOnExit(LabState::Hamerons),
+            ColorSampleRequest {
+                normalized_position,
+                serial,
+            },
+        ))
+        .observe(apply_color_sample);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_color_sample(
+    captured: On<ScreenshotCaptured>,
+    requests: Query<&ColorSampleRequest>,
+    sampler: Res<ColorSampler>,
+    mut selector: ResMut<ColorSelector>,
+    mut images: ResMut<Assets<Image>>,
+    panel: Res<PaintPanelState>,
+    mut settings: ResMut<StrokeRendererSettings>,
+    mut rgba: ResMut<RgbaPaintModel>,
+    mut pigment: ResMut<PigmentPaintModel>,
+    mut status: ResMut<DocumentStatus>,
+) {
+    let Ok(request) = requests.get(captured.entity) else {
+        return;
+    };
+    if request.serial != sampler.latest_serial {
+        return;
+    }
+    let image = &captured.image;
+    let pixel =
+        sample_pixel_coordinates(request.normalized_position, image.width(), image.height());
+    let Ok(color) = image.get_color_at(pixel.x, pixel.y) else {
+        status.0 = "colour sample failed: screenshot pixel was unavailable".into();
+        return;
+    };
+    let sampled = color.to_srgba();
+    let srgb = [sampled.red, sampled.green, sampled.blue];
+    set_selector_srgb(&mut selector, srgb);
+    if let Some(mut selector_image) = images.get_mut(&selector.image) {
+        *selector_image = color_selector_image(&selector);
+    }
+    apply_selected_paint_material(&panel, &selector, &mut settings, &mut rgba, &mut pigment);
+    status.0 = format!(
+        "sampled colour #{:02X}{:02X}{:02X}",
+        color_byte(srgb[0]),
+        color_byte(srgb[1]),
+        color_byte(srgb[2])
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_mouse_strokes(
     mut cursor_events: MessageReader<CursorMoved>,
@@ -1964,6 +2023,7 @@ fn collect_mouse_strokes(
     mut pointer: ResMut<PointerState>,
     selector: Res<ColorSelector>,
     panel: Res<PaintPanelState>,
+    sampler: Res<ColorSampler>,
 ) {
     let mut positions: Vec<_> = cursor_events.read().map(|event| event.position).collect();
     if positions.is_empty()
@@ -1986,6 +2046,16 @@ fn collect_mouse_strokes(
     let pressed = mouse_buttons.just_pressed(MouseButton::Left)
         || mouse_buttons.just_pressed(MouseButton::Right);
     let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+
+    if sampler.active() {
+        end_mouse_stroke(&mut document, &mut mouse);
+        sizing.end(PointerSource::Mouse);
+        for position in positions {
+            pointer.show_mouse(position, panel.selected_tool, false);
+        }
+        pointer.down = false;
+        return;
+    }
 
     if selector.hovered || selector.drag.is_some() || panel.hovered {
         end_mouse_stroke(&mut document, &mut mouse);
@@ -2851,7 +2921,7 @@ fn update_hud(
     };
     let content = format!(
         "HAMERONS STROKE  /  {}  •  {:.0} px  •  {} mix  •  pressure {}  •  tilt {:.0}°  •  {}\n\
-         LMB selected tool / RMB erase   SMEAR drags wet pigment   Shift+drag size   [ ] size   C clear   Ctrl+Z undo   V {}   Ctrl+S/O save/load   Esc menu\n\
+         LMB selected tool / RMB erase   Ctrl+click sample colour   SMEAR drags wet pigment   Shift+drag size   [ ] size   C clear   Ctrl+Z undo   V {}   Ctrl+S/O save/load   Esc menu\n\
          LAYER {}/{}  •  {}  •  {:.0}%  •  {}   N new   PgUp/Dn select   Shift+Pg move   H hide   , . opacity\n\
          ENGINE  •  {} strokes  •  {} points  •  {} segments  •  {} resident tiles  •  {}",
         pointer.tool.label(),
@@ -3008,6 +3078,39 @@ mod tests {
     }
 
     #[test]
+    fn sampled_srgb_round_trips_through_the_selector() {
+        for expected in [
+            [0.82, 0.13, 0.27],
+            [0.12, 0.74, 0.68],
+            [0.31, 0.31, 0.31],
+            [0.0, 0.0, 0.0],
+        ] {
+            let mut selector = ColorSelector::default();
+            set_selector_srgb(&mut selector, expected);
+            let actual = selector_srgb(&selector);
+            for channel in 0..3 {
+                assert!((actual[channel] - expected[channel]).abs() < 0.000_01);
+            }
+        }
+    }
+
+    #[test]
+    fn color_sample_coordinates_follow_scaled_screenshot_dimensions() {
+        assert_eq!(
+            sample_pixel_coordinates(Vec2::new(0.5, 0.25), 2_400, 1_500),
+            UVec2::new(1_200, 375)
+        );
+        assert_eq!(
+            sample_pixel_coordinates(Vec2::ONE, 2_400, 1_500),
+            UVec2::new(2_399, 1_499)
+        );
+        assert_eq!(
+            sample_pixel_coordinates(Vec2::new(-1.0, 2.0), 0, 0),
+            UVec2::ZERO
+        );
+    }
+
+    #[test]
     fn smear_tool_selects_the_no_paint_primary_pen_mode() {
         assert_eq!(stroke_input_mode(Tool::Pen), StrokeInputMode::Paint);
         assert_eq!(stroke_input_mode(Tool::Eraser), StrokeInputMode::Erase);
@@ -3015,22 +3118,14 @@ mod tests {
     }
 
     #[test]
-    fn pigment_smear_controls_create_toggle_and_adjust_the_native_effect() {
-        let mut document = PaintStrokeDocument::default();
-        assert!(smear_effect(&document).is_none());
-
-        ensure_smear_effect(&mut document);
-        let (_, default_parameters, enabled) = smear_effect(&document).unwrap();
-        assert!(enabled);
-        assert_eq!(default_parameters, SmearParameters::default());
-
-        change_smear_strength(&mut document, 0.1);
-        let (_, stronger, enabled) = smear_effect(&document).unwrap();
-        assert!(enabled);
-        assert!((stronger.strength - 0.75).abs() < f32::EPSILON);
-
-        toggle_smear_effect(&mut document);
-        assert!(!smear_effect(&document).unwrap().2);
+    fn brush_softness_controls_are_per_tool_and_clamped() {
+        let mut settings = StrokeRendererSettings::default();
+        let eraser_softness = settings.eraser.softness;
+        change_brush_softness(Tool::Pen, &mut settings, 2.0);
+        assert_eq!(settings.pen.softness, 1.0);
+        assert_eq!(settings.eraser.softness, eraser_softness);
+        change_brush_softness(Tool::Pen, &mut settings, -2.0);
+        assert_eq!(settings.pen.softness, 0.0);
     }
 
     #[test]
