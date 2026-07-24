@@ -27,7 +27,7 @@ use vector_stroke_render::{
     CanvasExtent, DocumentLimits, Srgba8, StrokeDocument as VectorStrokeDocument,
     StrokeInputSystems as VectorStrokeInputSystems, StrokeRenderStats, VectorCanvasView,
     VectorStrokeInputBlocker, VectorStrokePlugin, VectorStrokeSettings, VectorStrokeTarget,
-    load_json_file as load_vector_json, save_json_atomic as save_vector_json,
+    load_ron_file as load_vector_ron, save_ron_atomic as save_vector_ron,
 };
 
 const START_WIDTH: u32 = 1_200;
@@ -37,7 +37,7 @@ const MAX_BRUSH_SIZE: f32 = 180.0;
 const SIZE_DRAG_SENSITIVITY: f32 = 0.35;
 const VECTOR_MIN_WIDTH_FACTOR: f32 = 0.08;
 const PAINT_DOCUMENT_PATH: &str = "stroke_lab.kra";
-const VECTOR_DOCUMENT_PATH: &str = "stroke_lab.ink.json";
+const VECTOR_DOCUMENT_PATH: &str = "stroke_lab.ink.ron";
 const PICKER_WIDTH: u32 = 270;
 const PICKER_HEIGHT: u32 = 310;
 const PICKER_TOP: f32 = 14.0;
@@ -162,8 +162,10 @@ type RendererMenuInteraction<'w, 's> = Query<
         &'static Interaction,
         &'static RendererMenuButton,
         &'static mut BackgroundColor,
+        &'static ComputedNode,
+        &'static UiGlobalTransform,
     ),
-    (Changed<Interaction>, With<Button>),
+    With<Button>,
 >;
 
 #[derive(Resource, Default)]
@@ -427,7 +429,7 @@ fn setup_renderer_menu(
                 parent,
                 LabState::Vector,
                 "2   VECTOR STROKE RENDERER",
-                "Editable pressure-sensitive paths · saves stroke_lab.ink.json",
+                "Editable pressure-sensitive paths · saves stroke_lab.ink.ron",
             );
             parent.spawn((
                 Text::new("Press 1 or 2, or select with the pointer"),
@@ -486,6 +488,7 @@ fn spawn_renderer_button(
 
 fn renderer_menu_interaction(
     keys: Res<ButtonInput<KeyCode>>,
+    mut pen_events: MessageReader<PenInput>,
     mut buttons: RendererMenuInteraction,
     mut next_state: ResMut<NextState<LabState>>,
 ) {
@@ -495,14 +498,34 @@ fn renderer_menu_interaction(
         next_state.set(LabState::Vector);
     }
 
-    for (interaction, button, mut background) in &mut buttons {
-        *background = match *interaction {
-            Interaction::Pressed => {
+    let pen_press = pen_events.read().find_map(|event| {
+        (event.pen.primary
+            && matches!(
+                &event.action,
+                PenAction::Button {
+                    button: PenButton::Contact,
+                    state,
+                    ..
+                } if state.is_pressed()
+            ))
+        .then_some(event.pen.position)
+        .flatten()
+    });
+
+    for (interaction, button, mut background, node, transform) in &mut buttons {
+        let pressed_with_pen =
+            pen_press.is_some_and(|position| node.contains_point(*transform, position));
+        *background = match (*interaction, pressed_with_pen) {
+            (_, true) => {
                 next_state.set(button.0);
                 BackgroundColor(Color::srgb_u8(57, 78, 116))
             }
-            Interaction::Hovered => BackgroundColor(Color::srgb_u8(47, 58, 78)),
-            Interaction::None => BackgroundColor(Color::srgb_u8(34, 40, 52)),
+            (Interaction::Pressed, false) => {
+                next_state.set(button.0);
+                BackgroundColor(Color::srgb_u8(57, 78, 116))
+            }
+            (Interaction::Hovered, false) => BackgroundColor(Color::srgb_u8(47, 58, 78)),
+            (Interaction::None, false) => BackgroundColor(Color::srgb_u8(34, 40, 52)),
         };
     }
 }
@@ -1446,7 +1469,7 @@ fn vector_keyboard_shortcuts(
         session.status = format!("history: {error}");
     }
     if ctrl && keys.just_pressed(KeyCode::KeyS) {
-        session.status = match save_vector_json(VECTOR_DOCUMENT_PATH, &document) {
+        session.status = match save_vector_ron(VECTOR_DOCUMENT_PATH, &document) {
             Ok(()) => format!("saved {VECTOR_DOCUMENT_PATH}"),
             Err(error) => format!("save failed: {error}"),
         };
@@ -1455,7 +1478,7 @@ fn vector_keyboard_shortcuts(
         if document.has_active_strokes() {
             session.status = "finish the active stroke before loading".into();
         } else {
-            match load_vector_json(VECTOR_DOCUMENT_PATH, DocumentLimits::default()) {
+            match load_vector_ron(VECTOR_DOCUMENT_PATH, DocumentLimits::default()) {
                 Ok(mut loaded) => {
                     let (new_canvas, new_layer, extent) =
                         ensure_vector_surface(&mut loaded, &mut session);
@@ -1647,7 +1670,7 @@ fn update_vector_hud(
         .unwrap_or_else(|| "LAYER unavailable".into());
     let content = format!(
         "VECTOR STROKE  /  {}  •  {:.0} px  •  pressure {}  •  {}  •  {}\n\
-         LMB/RMB draw/erase   Shift+drag size   [ ] size   C clear   Ctrl+Z undo   V {}   Ctrl+S/O JSON   Esc menu\n\
+         LMB/RMB draw/erase   Shift+drag size   [ ] size   C clear   Ctrl+Z undo   V {}   Ctrl+S/O RON   Esc menu\n\
          {}   N new   PgUp/Dn select   Shift+Pg move   H hide   , . opacity\n\
          ENGINE  •  {} strokes  •  {} points  •  {} visible meshes  •  {} cached meshes  •  {}",
         pointer.tool.label(),

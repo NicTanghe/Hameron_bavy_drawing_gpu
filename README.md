@@ -7,7 +7,7 @@ states to activate exactly one backend at a time:
 - **Hamerons Paint Renderer** uses the existing GPU paint/tile backend and
   persists documents as `stroke_lab.kra`.
 - **Vector Stroke Renderer** keeps editable pressure-sensitive stroke paths and
-  persists them as `stroke_lab.ink.json`.
+  persists them as `stroke_lab.ink.ron`.
 
 Both documents remain in memory when returning to the menu, so switching
 renderers does not mix their output or throw away the current session.
@@ -20,7 +20,7 @@ cargo run --release
 
 ## Controls
 
-- Menu: choose a renderer with its button or press `1` / `2`.
+- Menu: choose a renderer with mouse or pen contact, or press `1` / `2`.
 - Tablet pen contact: draw with pressure and tilt.
 - Tablet eraser tip: erase.
 - Left mouse drag: draw.
@@ -44,4 +44,4 @@ commits an immutable material for subsequent strokes.
 
 The Hamerons preview uses its pressure/tilt brush footprint. The vector preview
 shows the pressure-adjusted path width; pressure and tilt samples are retained
-in the JSON document for later editing or export.
+in the RON document for later editing or export.
